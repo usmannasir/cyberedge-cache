@@ -10,6 +10,7 @@ define( 'CYBEREDGE_CONTROLLER_URL', 'https://controller.example.test' );
 define( 'CYBEREDGE_PURGE_SECRET', str_repeat( 'secret-', 8 ) );
 define( 'WP_CLI', true );
 $hooks = array(); $hook_stack = array(); $options = array(); $scheduled = array(); $flags = array(); $http_calls = array(); $comments = array();
+$admin_pages = array(); $assets = array( 'styles' => array(), 'scripts' => array(), 'localized' => array() );
 $test_count = 0;
 
 function check( $condition, $message ) {
@@ -53,6 +54,19 @@ function get_comment( $id ) { return $GLOBALS['comments'][$id] ?? null; }
 function wp_die( $message ) { throw new RuntimeException( $message ); }
 function esc_html( $value ) { return htmlspecialchars( $value ); }
 function current_user_can( $capability ) { return true; }
+function add_management_page( $title, $menu, $capability, $slug, $callback ) {
+    $GLOBALS['admin_pages'][$slug] = compact( 'title', 'menu', 'capability', 'callback' );
+    return 'tools_page_' . $slug;
+}
+function plugins_url( $path, $file ) { return 'https://example.test/wp-content/plugins/cyberedge-cache/' . ltrim( $path, '/' ); }
+function admin_url( $path = '' ) { return 'https://example.test/wp-admin/' . ltrim( $path, '/' ); }
+function home_url( $path = '' ) { return 'https://example.test/' . ltrim( $path, '/' ); }
+function esc_url( $value ) { return $value; }
+function wp_enqueue_style( $handle, $source, $dependencies, $version ) { $GLOBALS['assets']['styles'][$handle] = compact( 'source', 'dependencies', 'version' ); }
+function wp_enqueue_script( $handle, $source, $dependencies, $version, $footer ) { $GLOBALS['assets']['scripts'][$handle] = compact( 'source', 'dependencies', 'version', 'footer' ); }
+function wp_localize_script( $handle, $name, $value ) { $GLOBALS['assets']['localized'][$handle] = compact( 'name', 'value' ); }
+function wp_nonce_field( $action ) { echo '<input type="hidden" name="_wpnonce" value="test">'; }
+function submit_button( $label ) { echo '<button type="submit">' . esc_html( $label ) . '</button>'; }
 function is_user_logged_in() { return $GLOBALS['flags']['logged_in'] ?? false; }
 function is_admin() { return $GLOBALS['flags']['admin'] ?? false; }
 function is_preview() { return $GLOBALS['flags']['preview'] ?? false; }
@@ -118,6 +132,19 @@ try {
     check( isset( WP_CLI::$commands['cyberedge deliver'], WP_CLI::$commands['cyberedge purge'] ), 'CLI commands registered' );
     check( isset( $hooks['admin_menu'], $hooks['admin_enqueue_scripts'], $hooks['admin_bar_menu'],
         $hooks['admin_post_cyberedge_purge'], $hooks['site_status_tests'] ), 'Dashboard, manual purge, and Site Health hooks registered' );
+    do_action( 'admin_menu' );
+    check( isset( $admin_pages['cyberedge-cache'] ), 'CyberEdge dashboard is registered under WordPress Tools' );
+    do_action( 'admin_enqueue_scripts', 'tools_page_cyberedge-cache' );
+    check( isset( $assets['styles']['cyberedge-cache-admin'], $assets['scripts']['cyberedge-cache-admin'] ), 'Dashboard assets load only through registered WordPress assets' );
+    check( $assets['localized']['cyberedge-cache-admin']['value']['cacheHeader'] === 'X-CyberEdge-Cache', 'Live check uses the branded customer header' );
+    $bar = new class { public $nodes = array(); public function add_node( $node ) { $this->nodes[] = $node; } };
+    do_action( 'admin_bar_menu', $bar );
+    check( $bar->nodes[0]['href'] === 'https://example.test/wp-admin/tools.php?page=cyberedge-cache', 'Admin bar opens the CyberEdge dashboard' );
+    ob_start(); $GLOBALS['cyberedge_cache']->status_page(); $dashboard = ob_get_clean();
+    check( strpos( $dashboard, 'Live cache status' ) !== false && strpos( $dashboard, 'View bandwidth usage' ) !== false &&
+        strpos( $dashboard, 'Purge CyberEdge cache worldwide' ) !== false, 'Dashboard exposes cache, bandwidth, and purge journeys' );
+    check( strpos( $dashboard, CYBEREDGE_PURGE_SECRET ) === false && strpos( $dashboard, CYBEREDGE_CONTROLLER_URL ) === false,
+        'Dashboard never renders controller credentials' );
     $health = $GLOBALS['cyberedge_cache']->site_health();
     check( $health['status'] === 'good' && $health['test'] === 'cyberedge_cache', 'Healthy local delivery is reported to Site Health' );
     $rest_response = new class {
