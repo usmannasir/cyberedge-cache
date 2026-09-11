@@ -4,7 +4,7 @@ Tags: cache, edge cache, cdn, litespeed, woocommerce
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 0.3.0
+Stable tag: 0.4.0
 License: GPLv3 or later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -16,15 +16,15 @@ CyberEdge Cache supplies conservative full-page cache signals and reliably queue
 
 The plugin is designed to coexist with LiteSpeed Cache for WordPress. When LiteSpeed page caching is active, LiteSpeed remains responsible for public cacheability. CyberEdge continues to protect private WordPress, REST, login, preview, cart, checkout, and account traffic. When LiteSpeed is absent, disabled, or installed only for optimization, CyberEdge can supply a conservative anonymous-HTML fallback policy.
 
-This plugin requires server-side site credentials issued during CyberEdge provisioning. It does not independently create an edge account, change DNS, or deploy edge nodes.
+Connect from Tools → CyberEdge Cache. The plugin sends you to the CyberEdge platform to sign in or create an account, choose a plan, finish domain setup, approve the connection, and return automatically. The one-use code is bound to this site's exact HTTPS callback; the private purge credential is encrypted locally and never appears in the browser URL.
 
 == Installation ==
 
-1. Complete site enrollment in the CyberEdge customer platform.
-2. Install the `cyberedge-cache` directory in `wp-content/plugins/`.
-3. Configure the site ID, HTTPS controller origin, and per-site purge secret in server-side `wp-config.php` as instructed during enrollment.
-4. Activate CyberEdge Cache for the individual site.
-5. Confirm the persistent `wp cyberedge deliver` worker is running at least once per minute.
+1. Install the `cyberedge-cache` directory in `wp-content/plugins/` and activate it for the individual site.
+2. Open Tools → CyberEdge Cache and click Connect to CyberEdge.
+3. Sign in or create an account, choose a plan, and complete domain activation if needed.
+4. Approve the exact WordPress site and return to the plugin automatically.
+5. Confirm the connection, live cache status, and purge queue are healthy.
 
 Do not network-activate the plugin. Each multisite tenant needs separate credentials and explicit configuration.
 
@@ -43,6 +43,13 @@ No. Authenticated, cookie-bearing, REST, cart, checkout, account, preview, searc
 WordPress mutations synchronously create a durable local outbox event. A background worker sends signed events to the site's CyberEdge controller. Delivery retries reuse the same event identity until the controller provides a valid acknowledgement.
 
 == Changelog ==
+
+= 0.4.0 =
+
+* Add one-click platform login, signup, plan, domain, consent, and WordPress return flow.
+* Bind one-use authorization codes to the exact HTTPS callback with PKCE S256.
+* Encrypt the per-domain connection locally using the WordPress authentication salt.
+* Allow activation before enrollment and wake the background worker immediately after queued changes.
 
 = 0.3.0 =
 

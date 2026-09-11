@@ -2,9 +2,15 @@
 
 This plugin delivers **whole-site** purge events to the controller. It preserves native LiteSpeed Cache for WordPress (LSCWP) cacheability decisions when its page cache is active and supplies a conservative public HTML fallback when that page cache is unavailable. It does not implement ESI or claim the same tag dependency graph as LSCWP.
 
-## Automated installation contract
+## One-click customer connection
 
-The provisioning service must install this plugin on the origin, inject these constants into server-side `wp-config.php`, activate it, and install a persistent origin worker before enabling edge caching:
+Install and activate the plugin, then open **Tools → CyberEdge Cache → Connect to CyberEdge**. The plugin creates a PKCE security proof, sends the administrator to the CyberEdge platform to sign in or create an account, preserves the journey through plan and domain setup, and returns to the exact WordPress callback after explicit approval. A five-minute authorization code is exchanged server-to-server and can be used only once. The per-domain purge credential is encrypted at rest with AES-256-GCM using the site's WordPress authentication salt; it is never placed in the browser URL or rendered in the dashboard.
+
+Activation is allowed before enrollment. Once connected, every persisted purge schedules an immediate WordPress cron wake as well as the recurring retry worker. On managed origins, the system timer below remains the strongest delivery guarantee because fully cached traffic may not execute WordPress.
+
+## Managed installation contract
+
+Managed provisioning may inject these constants into server-side `wp-config.php`; they take precedence over a one-click connection:
 
 ```php
 define('CYBEREDGE_SITE_ID', getenv('CYBEREDGE_SITE_ID'));
@@ -16,9 +22,9 @@ define('CYBEREDGE_CACHE_TTL', 300);
 
 The controller URL is an HTTPS origin, without a path, query, fragment, or embedded credentials. The site ID uses letters, digits, underscores, and hyphens. Generate a separate random purge secret of at least 32 bytes per site. Never place it in HTML, JavaScript, public configuration endpoints, command-line arguments, or access logs. It authorizes only this site's purge endpoint. Secret rotation is safe for queued events after the controller begins accepting the replacement secret. Controller/site changes require an explicit migration of old queued events; they are deliberately never sent to a different tenant or destination.
 
-Activate per site with `wp plugin activate cyberedge-cache`. Network activation is rejected. Multisite requires separate provisioning and a matching `CYBEREDGE_BLOG_ID`; a single network-wide constant set is not sufficient for multiple tenants. Activation creates the `{prefix}cyberedge_purge_outbox` table and enqueues an initial purge. Deactivation stops the WordPress schedule and keeps pending rows.
+Activate per site with `wp plugin activate cyberedge-cache`. Network activation is rejected. Multisite requires separate provisioning and a matching `CYBEREDGE_BLOG_ID`; a single network-wide constant set is not sufficient for multiple tenants. Activation creates the `{prefix}cyberedge_purge_outbox` table. It enqueues an initial purge immediately when managed credentials already exist; otherwise the first purge is queued after one-click approval. Deactivation stops both WordPress schedules and keeps pending rows.
 
-Provision an origin system timer to run `wp --path=/origin/wordpress cyberedge deliver` at least once per minute as that site's operating-system user. The WP-Cron minute schedule is an additional retry path. **Do not depend on visitor-triggered WP-Cron:** cache hits do not reach WordPress. Each worker handles at most ten ready events; provision additional worker runs or increase the tested worker capacity if the queue age rises. SQL compare-and-swap leases prevent simultaneous delivery of an active event. The controller must tolerate retries after a worker crashes after remote acceptance.
+For managed origins, provision a system timer to run `wp --path=/origin/wordpress cyberedge deliver` at least once per minute as that site's operating-system user. The plugin also schedules an immediate loopback cron wake and a minute retry schedule. A system timer is still recommended because cache hits do not reach WordPress and hosts may disable loopback requests. Each worker handles at most ten ready events; provision additional worker runs or increase the tested worker capacity if the queue age rises. SQL compare-and-swap leases prevent simultaneous delivery of an active event. The controller must tolerate retries after a worker crashes after remote acceptance.
 
 `wp cyberedge purge` durably enqueues a whole-site event. `wp cyberedge deliver` submits queued events and returns an error if any attempted delivery fails. `wp cyberedge status` returns queue depth and oldest enqueue time, without secrets. The installer/controller should monitor oldest-event age and worker success. A queue older than five minutes or a failed enqueue produces an administrator notice. A failed enqueue sets the persistent `cyberedge_purge_enqueue_failed` option: after fixing the database/configuration issue, enqueue a full purge, confirm acceptance, then clear that alarm with `wp option delete cyberedge_purge_enqueue_failed`.
 

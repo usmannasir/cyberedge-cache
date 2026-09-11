@@ -47,6 +47,7 @@ function register_activation_hook( ...$args ) {}
 function register_deactivation_hook( ...$args ) {}
 function wp_next_scheduled( $hook ) { return $GLOBALS['scheduled'][$hook] ?? false; }
 function wp_schedule_event( $time, $schedule, $hook ) { $GLOBALS['scheduled'][$hook] = $time; return true; }
+function wp_schedule_single_event( $time, $hook ) { $GLOBALS['scheduled'][$hook] = $time; return true; }
 function wp_clear_scheduled_hook( $hook ) { unset( $GLOBALS['scheduled'][$hook] ); }
 function update_option( $name, $value, $autoload = null ) { $GLOBALS['options'][$name] = $value; }
 function get_option( $name ) { return $GLOBALS['options'][$name] ?? false; }
@@ -131,7 +132,8 @@ try {
     check( wp_next_scheduled( CyberEdge_Cache::CRON ) !== false, 'Activation schedules the retry worker' );
     check( isset( WP_CLI::$commands['cyberedge deliver'], WP_CLI::$commands['cyberedge purge'] ), 'CLI commands registered' );
     check( isset( $hooks['admin_menu'], $hooks['admin_enqueue_scripts'], $hooks['admin_bar_menu'],
-        $hooks['admin_post_cyberedge_purge'], $hooks['site_status_tests'] ), 'Dashboard, manual purge, and Site Health hooks registered' );
+        $hooks['admin_post_cyberedge_purge'], $hooks['admin_post_cyberedge_connect_start'],
+        $hooks['admin_post_cyberedge_connect_callback'], $hooks['site_status_tests'] ), 'Dashboard, pairing, manual purge, and Site Health hooks registered' );
     do_action( 'admin_menu' );
     check( isset( $admin_pages['cyberedge-cache'] ), 'CyberEdge dashboard is registered under WordPress Tools' );
     do_action( 'admin_enqueue_scripts', 'tools_page_cyberedge-cache' );
