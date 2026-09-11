@@ -140,6 +140,9 @@ try {
     do_action( 'admin_enqueue_scripts', 'tools_page_cyberedge-cache' );
     check( isset( $assets['styles']['cyberedge-cache-admin'], $assets['scripts']['cyberedge-cache-admin'] ), 'Dashboard assets load only through registered WordPress assets' );
     check( $assets['localized']['cyberedge-cache-admin']['value']['cacheHeader'] === 'X-CyberEdge-Cache', 'Live check uses the branded customer header' );
+    $admin_script = file_get_contents( dirname( __DIR__ ) . '/cyberedge-cache/assets/admin.js' );
+    check( strpos( $admin_script, "method: 'GET'" ) !== false, 'Live check exercises a cacheable visitor GET' );
+    check( strpos( $admin_script, "method: 'HEAD'" ) === false, 'Live check does not use an intentionally uncacheable HEAD request' );
     $bar = new class { public $nodes = array(); public function add_node( $node ) { $this->nodes[] = $node; } };
     do_action( 'admin_bar_menu', $bar );
     check( $bar->nodes[0]['href'] === 'https://example.test/wp-admin/tools.php?page=cyberedge-cache', 'Admin bar opens the CyberEdge dashboard' );

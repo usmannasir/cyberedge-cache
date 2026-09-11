@@ -4,7 +4,7 @@ Tags: cache, edge cache, cdn, litespeed, woocommerce
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 0.4.1
+Stable tag: 0.4.2
 License: GPLv3 or later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -43,6 +43,10 @@ No. Authenticated, cookie-bearing, REST, cart, checkout, account, preview, searc
 WordPress mutations synchronously create a durable local outbox event. A background worker sends signed events to the site's CyberEdge controller. Delivery retries reuse the same event identity until the controller provides a valid acknowledgement.
 
 == Changelog ==
+
+= 0.4.2 =
+
+* Make the dashboard's live cache check use an anonymous visitor GET so it can observe the real edge MISS or HIT result.
 
 = 0.4.1 =
 

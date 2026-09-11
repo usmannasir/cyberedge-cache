@@ -9,7 +9,9 @@
     result.className = 'cyberedge-result is-checking';
     result.textContent = 'Checking…';
     fetch(window.CyberEdgeCacheAdmin.homeUrl, {
-      method: 'HEAD',
+      // CyberEdge deliberately does not cache HEAD responses, so use an
+      // anonymous GET to exercise the same path a visitor actually receives.
+      method: 'GET',
       credentials: 'omit',
       redirect: 'follow'
     }).then(function (response) {

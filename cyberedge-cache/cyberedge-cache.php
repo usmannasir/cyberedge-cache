@@ -3,7 +3,7 @@
  * Plugin Name: CyberEdge Cache
  * Plugin URI: https://github.com/usmannasir/cyberedge-cache
  * Description: Durable site purge delivery to CyberEdge and conservative public page cache signals.
- * Version: 0.4.1
+ * Version: 0.4.2
  * Requires at least: 6.2
  * Requires PHP: 7.4
  * Author: CyberPanel
@@ -457,7 +457,7 @@ final class CyberEdge_Cache {
     public function admin_assets( $hook ) {
         if ( $hook !== $this->admin_page_hook ) { return; }
         wp_enqueue_style( 'cyberedge-cache-admin', plugins_url( 'assets/admin.css', __FILE__ ), array(), '0.4.0' );
-        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.4.0', true );
+        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.4.2', true );
         wp_localize_script( 'cyberedge-cache-admin', 'CyberEdgeCacheAdmin', array(
             'homeUrl' => home_url( '/' ),
             'cacheHeader' => 'X-CyberEdge-Cache',
