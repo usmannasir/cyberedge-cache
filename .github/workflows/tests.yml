@@ -1,0 +1,41 @@
+name: Plugin tests
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  php:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.4', '8.1', '8.3']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo_sqlite
+          coverage: none
+      - name: Check PHP syntax
+        run: |
+          php -l cyberedge-cache/cyberedge-cache.php
+          php -l tests/outbox_test.php
+          php -l tests/lscache_compatibility_test.php
+      - name: Run isolated behavior suite
+        run: php tests/outbox_test.php
+      - name: Check audited LiteSpeed Cache contract
+        run: |
+          git clone --quiet https://github.com/litespeedtech/lscache_wp.git /tmp/lscache-audited
+          git -C /tmp/lscache-audited checkout --quiet a4bd5fa11b77c95c660f003aec6a6c0d982cc9a8
+          LSCACHE_WP_ROOT=/tmp/lscache-audited php tests/lscache_compatibility_test.php
+      - name: Check current LiteSpeed Cache contract
+        run: |
+          git clone --quiet --depth 1 https://github.com/litespeedtech/lscache_wp.git /tmp/lscache-current
+          LSCACHE_WP_ROOT=/tmp/lscache-current php tests/lscache_compatibility_test.php
