@@ -3,7 +3,7 @@
  * Plugin Name: CyberEdge Cache
  * Plugin URI: https://github.com/usmannasir/cyberedge-cache
  * Description: Durable site purge delivery to CyberEdge and conservative public page cache signals.
- * Version: 0.4.0
+ * Version: 0.4.1
  * Requires at least: 6.2
  * Requires PHP: 7.4
  * Author: CyberPanel
@@ -245,6 +245,7 @@ final class CyberEdge_Cache {
         add_action( 'admin_post_cyberedge_purge', array( $this, 'manual_purge' ) );
         add_action( 'admin_post_cyberedge_connect_start', array( $this, 'connect_start' ) );
         add_action( 'admin_post_cyberedge_connect_callback', array( $this, 'connect_callback' ) );
+        add_action( 'admin_post_nopriv_cyberedge_connect_callback', array( $this, 'connect_login' ) );
         add_filter( 'site_status_tests', array( $this, 'site_health_tests' ) );
         if ( defined( 'WP_CLI' ) && WP_CLI ) {
             WP_CLI::add_command( 'cyberedge purge', function () {
@@ -574,6 +575,19 @@ final class CyberEdge_Cache {
         $this->ensure_schedule();
         $this->enqueue( 'connected' );
         wp_safe_redirect( add_query_arg( 'cyberedge_connected', 'yes', admin_url( 'tools.php?page=cyberedge-cache' ) ) );
+        exit;
+    }
+
+    public function connect_login() {
+        $code = isset( $_GET['code'] ) ? wp_unslash( $_GET['code'] ) : '';
+        $state = isset( $_GET['state'] ) ? wp_unslash( $_GET['state'] ) : '';
+        $issuer = isset( $_GET['iss'] ) ? wp_unslash( $_GET['iss'] ) : '';
+        if ( ! preg_match( '/\A[A-Za-z0-9_-]{43}\z/', $code ) || ! preg_match( '/\A[A-Za-z0-9_-]{43}\z/', $state ) || $issuer !== self::PLATFORM ) {
+            wp_die( 'The CyberEdge connection return is invalid. Start again from the plugin.' );
+        }
+        // WordPress preserves this exact request as redirect_to and dispatches
+        // the authenticated callback after the administrator signs in.
+        auth_redirect();
         exit;
     }
 

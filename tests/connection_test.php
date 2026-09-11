@@ -29,6 +29,9 @@ function add_query_arg( $args, $value = null, $url = null ) {
 class PairingRedirect extends RuntimeException {}
 function wp_redirect( $url ) { $GLOBALS['redirect'] = $url; throw new PairingRedirect(); }
 function wp_die( $message ) { throw new RuntimeException( $message ); }
+function wp_unslash( $value ) { return $value; }
+class PairingLogin extends RuntimeException {}
+function auth_redirect() { throw new PairingLogin(); }
 $wpdb = (object) array( 'prefix' => 'wp_' );
 require __DIR__ . '/../cyberedge-cache/cyberedge-cache.php';
 
@@ -55,5 +58,12 @@ check_connection( $query['state'] === $pending['state'] && $query['code_challeng
 $expected = rtrim( strtr( base64_encode( hash( 'sha256', $pending['verifier'], true ) ), '+/', '-_' ), '=' );
 check_connection( hash_equals( $expected, $query['code_challenge'] ) && strpos( $redirect, $pending['verifier'] ) === false, 'Verifier stays inside WordPress' );
 check_connection( $query['redirect_uri'] === 'https://www.example.test/wp-admin/admin-post.php?action=cyberedge_connect_callback', 'Exact WordPress callback is sent' );
+$_GET = array( 'code' => str_repeat( 'c', 43 ), 'state' => str_repeat( 'd', 43 ), 'iss' => CyberEdge_Cache::PLATFORM );
+$login_started = false;
+try { $cache->connect_login(); } catch ( PairingLogin $login ) { $login_started = true; }
+check_connection( $login_started, 'A logged-out callback resumes through WordPress login' );
+$_GET['iss'] = 'https://attacker.example'; $rejected = false;
+try { $cache->connect_login(); } catch ( RuntimeException $error ) { $rejected = ! ( $error instanceof PairingLogin ); }
+check_connection( $rejected, 'A foreign callback issuer cannot start WordPress login' );
 echo json_encode( array( 'passed' => $checks, 'network_requests' => 0 ) ) . "\n";
 @rmdir( $root );
