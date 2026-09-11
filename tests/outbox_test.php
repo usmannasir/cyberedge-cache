@@ -281,7 +281,7 @@ try {
     define( 'LSCWP_V', 'test' );
     check( $worker->cache_policy() === 'public,max-age=300', 'Installed LSCWP without active page cache does not disable fallback' );
     define( 'LITESPEED_ON', true );
-    check( $worker->cache_policy() === null, 'Active LSCWP page cache determines public cacheability' );
+    check( $worker->cache_policy() === 'public,max-age=300', 'Active LSCWP still emits an explicit policy for the Edge reverse proxy' );
     define( 'LITESPEED_DISABLE_ALL', true );
     check( $worker->cache_policy() === 'public,max-age=300', 'Disabled LSCWP page cache does not disable fallback' );
     $flags['checkout'] = true;

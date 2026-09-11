@@ -3,7 +3,7 @@
  * Plugin Name: CyberEdge Cache
  * Plugin URI: https://github.com/usmannasir/cyberedge-cache
  * Description: Durable site purge delivery to CyberEdge and conservative public page cache signals.
- * Version: 0.4.2
+ * Version: 0.4.3
  * Requires at least: 6.2
  * Requires PHP: 7.4
  * Author: CyberPanel
@@ -380,13 +380,7 @@ final class CyberEdge_Cache {
         return wp_schedule_event( time() + 60, 'cyberedge_minute', self::CRON ) !== false;
     }
 
-    /** LSCWP can be installed for optimization while its page cache is off. */
-    private function lscache_controls_page_cache() {
-        return defined( 'LSCWP_V' ) && defined( 'LITESPEED_ON' ) && LITESPEED_ON &&
-            ( ! defined( 'LITESPEED_DISABLE_ALL' ) || ! LITESPEED_DISABLE_ALL );
-    }
-
-    /** Public fallback only without LSCWP. Existing application controls remain authoritative. */
+    /** Edge policy remains explicit even when the origin also runs LSCWP. */
     public function cache_policy() {
         $status = http_response_code();
         if ( $status !== false && $status !== 200 ) { return 'private,no-cache,no-store'; }
@@ -409,7 +403,6 @@ final class CyberEdge_Cache {
             ( defined( 'DONOTCACHEPAGE' ) && DONOTCACHEPAGE ) ) {
             return 'private,no-cache,no-store';
         }
-        if ( $this->lscache_controls_page_cache() ) { return null; }
         $ttl = defined( 'CYBEREDGE_CACHE_TTL' ) ? (int) CYBEREDGE_CACHE_TTL : 300;
         return $ttl > 0 ? 'public,max-age=' . min( 3600, $ttl ) : 'no-cache,no-store';
     }
@@ -456,8 +449,8 @@ final class CyberEdge_Cache {
 
     public function admin_assets( $hook ) {
         if ( $hook !== $this->admin_page_hook ) { return; }
-        wp_enqueue_style( 'cyberedge-cache-admin', plugins_url( 'assets/admin.css', __FILE__ ), array(), '0.4.0' );
-        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.4.2', true );
+        wp_enqueue_style( 'cyberedge-cache-admin', plugins_url( 'assets/admin.css', __FILE__ ), array(), '0.4.3' );
+        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.4.3', true );
         wp_localize_script( 'cyberedge-cache-admin', 'CyberEdgeCacheAdmin', array(
             'homeUrl' => home_url( '/' ),
             'cacheHeader' => 'X-CyberEdge-Cache',
@@ -482,8 +475,7 @@ final class CyberEdge_Cache {
             $status = $this->outbox->status();
         } catch ( Throwable $error ) { $configured = false; }
         $scheduled = wp_next_scheduled( self::CRON ) !== false;
-        $lscache = $this->lscache_controls_page_cache() ? 'Active; LiteSpeed controls public cacheability.' :
-            'Not active; CyberEdge uses its conservative anonymous HTML policy.';
+        $policy = 'CyberEdge sends an explicit edge policy for anonymous HTML and preserves every private or no-store veto.';
         $message = isset( $_GET['cyberedge_purge'] ) ? (string) $_GET['cyberedge_purge'] : '';
         echo '<div class="wrap cyberedge-admin"><header class="cyberedge-hero"><img src="' . esc_url( plugins_url( 'assets/cyberpanel-mark.svg', __FILE__ ) ) . '" alt="" width="56" height="56"><div><span>CYBERPANEL EDGE</span><h1>CyberEdge Cache</h1><p>Cache health, delivery status, and safe worldwide invalidation for this WordPress site.</p></div></header>';
         if ( $message === 'queued' ) { echo '<div class="notice notice-success"><p>A worldwide cache purge is queued.</p></div>'; }
@@ -492,7 +484,7 @@ final class CyberEdge_Cache {
         echo '<section class="cyberedge-card"><span class="cyberedge-card-label">CONNECTION</span><strong>' . ( $configured ? 'Ready' : 'Needs attention' ) . '</strong><p>Server-side site configuration is ' . ( $configured ? 'available.' : 'missing or invalid.' ) . '</p></section>';
         echo '<section class="cyberedge-card"><span class="cyberedge-card-label">DELIVERY WORKER</span><strong>' . ( $scheduled ? 'Scheduled' : 'Not scheduled' ) . '</strong><p>Reliable purge delivery requires this worker plus the provisioned system timer.</p></section>';
         echo '<section class="cyberedge-card"><span class="cyberedge-card-label">PURGE QUEUE</span><strong>' . esc_html( (string) $status['pending'] ) . '</strong><p>' . ( $status['oldest'] === null ? 'No events are waiting.' : 'Oldest event: ' . esc_html( (string) max( 0, time() - $status['oldest'] ) ) . ' seconds ago.' ) . '</p></section>';
-        echo '<section class="cyberedge-card"><span class="cyberedge-card-label">PAGE POLICY</span><strong>' . ( $this->lscache_controls_page_cache() ? 'LiteSpeed active' : 'CyberEdge fallback' ) . '</strong><p>' . esc_html( $lscache ) . '</p></section>';
+        echo '<section class="cyberedge-card"><span class="cyberedge-card-label">PAGE POLICY</span><strong>CyberEdge managed</strong><p>' . esc_html( $policy ) . '</p></section>';
         echo '</div><div class="cyberedge-columns"><section class="cyberedge-panel"><h2>Live cache status</h2><p>Check the public home page without WordPress login cookies. A first MISS may warm the page; check again to confirm a HIT.</p><div class="cyberedge-live-row"><button type="button" class="button button-primary" id="cyberedge-check-cache">Check cache status</button><strong id="cyberedge-cache-result" class="cyberedge-result" aria-live="polite">Not checked</strong></div><p class="description">Reads the customer-facing <code>X-CyberEdge-Cache</code> response header. No controller credential is sent.</p></section>';
         echo '<section class="cyberedge-panel"><h2>Bandwidth and domains</h2><p>Exact confirmed bandwidth, request usage, plan allowance, invoices, and per-domain serving state remain in your authenticated customer workspace.</p><a class="button button-secondary" href="https://platform.cyberpersons.com/edge/" target="_blank" rel="noopener noreferrer">View bandwidth usage →</a></section></div>';
         echo '<section class="cyberedge-panel cyberedge-purge"><h2>Purge worldwide</h2><p>Queue a durable whole-site purge after a deployment or when content must be invalidated immediately. Normal WordPress changes are already handled automatically.</p><form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';

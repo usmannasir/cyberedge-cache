@@ -4,7 +4,7 @@ Tags: cache, edge cache, cdn, litespeed, woocommerce
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 0.4.2
+Stable tag: 0.4.3
 License: GPLv3 or later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -43,6 +43,10 @@ No. Authenticated, cookie-bearing, REST, cart, checkout, account, preview, searc
 WordPress mutations synchronously create a durable local outbox event. A background worker sends signed events to the site's CyberEdge controller. Delivery retries reuse the same event identity until the controller provides a valid acknowledgement.
 
 == Changelog ==
+
+= 0.4.3 =
+* Keep the CyberEdge reverse-proxy policy explicit when LiteSpeed Cache is active at the origin.
+* Refresh the WordPress dashboard to match the current CyberPanel interface and improve responsive layout.
 
 = 0.4.2 =
 
