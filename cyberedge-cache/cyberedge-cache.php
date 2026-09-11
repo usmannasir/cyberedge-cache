@@ -3,7 +3,7 @@
  * Plugin Name: CyberEdge Cache
  * Plugin URI: https://github.com/usmannasir/cyberedge-cache
  * Description: Durable site purge delivery to CyberEdge and conservative public page cache signals.
- * Version: 0.4.3
+ * Version: 0.4.4
  * Requires at least: 6.2
  * Requires PHP: 7.4
  * Author: CyberPanel
@@ -415,7 +415,13 @@ final class CyberEdge_Cache {
         if ( ! headers_sent() ) {
             // Append, never erase an application's earlier private/no-store veto.
             header( 'X-LiteSpeed-Cache-Control: ' . $policy, false );
-            if ( strpos( $policy, 'no-store' ) !== false ) { header( 'Cache-Control: private, no-store', false ); }
+            if ( strpos( $policy, 'no-store' ) !== false ) {
+                header( 'Cache-Control: private, no-store', false );
+            } elseif ( preg_match( '/max-age=([0-9]+)/', $policy, $match ) ) {
+                // Origin LiteSpeed consumes its internal header. This shared-cache
+                // directive survives to CyberEdge while keeping browser max-age zero.
+                header( 'Cache-Control: public,max-age=0,s-maxage=' . $match[1], true );
+            }
         }
     }
 
@@ -449,8 +455,8 @@ final class CyberEdge_Cache {
 
     public function admin_assets( $hook ) {
         if ( $hook !== $this->admin_page_hook ) { return; }
-        wp_enqueue_style( 'cyberedge-cache-admin', plugins_url( 'assets/admin.css', __FILE__ ), array(), '0.4.3' );
-        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.4.3', true );
+        wp_enqueue_style( 'cyberedge-cache-admin', plugins_url( 'assets/admin.css', __FILE__ ), array(), '0.4.4' );
+        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.4.4', true );
         wp_localize_script( 'cyberedge-cache-admin', 'CyberEdgeCacheAdmin', array(
             'homeUrl' => home_url( '/' ),
             'cacheHeader' => 'X-CyberEdge-Cache',
