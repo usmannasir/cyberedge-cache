@@ -4,7 +4,7 @@ Tags: cache, edge cache, cdn, litespeed, woocommerce
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 0.4.4
+Stable tag: 0.4.5
 License: GPLv3 or later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -36,13 +36,23 @@ No. CyberEdge Cache can safely provide a conservative public-page policy without
 
 = Does this cache logged-in visitors or WooCommerce checkout pages? =
 
-No. Authenticated, cookie-bearing, REST, cart, checkout, account, preview, search, error, and other private requests receive a cache veto.
+No. Authenticated, REST, cart, checkout, account, preview, search, error, and other private requests receive a cache veto. Login, session, unknown, or malformed cookies also bypass; only a narrowly reviewed list of analytics cookie names may share an otherwise public response.
+
+= Why does Refresh show BYPASS when a normal visit shows HIT? =
+
+Browser refresh can send a zero-max-age request, and DevTools Disable cache can send no-cache. CyberEdge respects these explicit instructions. Keep Disable cache unchecked and navigate normally in a clean session to test visitor caching. The dashboard explains intentional bypasses separately from a missing CyberEdge header.
 
 = How are changed pages purged? =
 
 WordPress mutations synchronously create a durable local outbox event. A background worker sends signed events to the site's CyberEdge controller. Delivery retries reuse the same event identity until the controller provides a valid acknowledgement.
 
 == Changelog ==
+
+= 0.4.5 =
+* Permit narrowly reviewed analytics-only cookie requests while retaining private, unknown-cookie, malformed-cookie, and explicit no-cache safeguards at both origin and edge.
+* Explain HIT, MISS, and intentional BYPASS responses in the live status check.
+* Preserve late LiteSpeed no-cache, private, ESI, cookie, and vary decisions in the shared-cache response headers.
+* Expand cookie-policy, request-directive, dashboard, and LiteSpeed vary-contract regression tests.
 
 = 0.4.4 =
 * Carry the anonymous HTML policy through an origin LiteSpeed page-cache hit using a shared-cache directive with zero browser max-age.

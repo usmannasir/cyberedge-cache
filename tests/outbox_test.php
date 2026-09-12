@@ -140,6 +140,7 @@ try {
     do_action( 'admin_enqueue_scripts', 'tools_page_cyberedge-cache' );
     check( isset( $assets['styles']['cyberedge-cache-admin'], $assets['scripts']['cyberedge-cache-admin'] ), 'Dashboard assets load only through registered WordPress assets' );
     check( $assets['localized']['cyberedge-cache-admin']['value']['cacheHeader'] === 'X-CyberEdge-Cache', 'Live check uses the branded customer header' );
+    check( $assets['localized']['cyberedge-cache-admin']['value']['cacheReasonHeader'] === 'X-CyberEdge-Cache-Reason', 'Live check can explain intentional bypasses' );
     $admin_script = file_get_contents( dirname( __DIR__ ) . '/cyberedge-cache/assets/admin.js' );
     check( strpos( $admin_script, "method: 'GET'" ) !== false, 'Live check exercises a cacheable visitor GET' );
     check( strpos( $admin_script, "method: 'HEAD'" ) === false, 'Live check does not use an intentionally uncacheable HEAD request' );
@@ -277,6 +278,55 @@ try {
         $_SERVER[$header] = 'test'; check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Bypass request input: ' . $header ); unset( $_SERVER[$header] );
     }
     $_COOKIE['woocommerce_items_in_cart'] = '1'; check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'WooCommerce cart cookie bypass' ); $_COOKIE = array();
+    foreach ( array( '_ga', '_gid', '_gat', '_gcl_au', '_fbp', '_ga_ABC123', '_gat_abc123' ) as $name ) {
+        $_SERVER['HTTP_COOKIE'] = $name . '=GA1.1.123.456'; $_COOKIE = array( $name => 'GA1.1.123.456' );
+        check( $worker->cache_policy() === 'public,max-age=300', 'Reviewed analytics cookie remains public: ' . $name );
+    }
+    foreach ( array(
+        '_ga=GA1.1.123.456; _gid=GA1.1.321.654',
+        "\t_ga=GA1.1.123.456 ;\t_gid=1\t", '_ga=', '_ga=value=with=equals',
+    ) as $raw ) {
+        $_SERVER['HTTP_COOKIE'] = $raw; $_COOKIE = array();
+        check( $worker->cache_policy() === 'public,max-age=300', 'Strict analytics-only raw cookie list remains public' );
+    }
+    foreach ( array(
+        'wordpress_logged_in_hash', 'wordpress_sec_hash', 'wp-postpass_hash', 'comment_author_hash',
+        '_lscache_vary', 'woocommerce_items_in_cart', 'woocommerce_cart_hash', 'wp_woocommerce_session_hash',
+        'PHPSESSID', 'custom_session', 'currency', 'language', 'consent', '_ga_custom_session',
+        '_gat_custom_session', '_ga_', '_gat_', '_GA', '_ga.extra', '_ga extra', '_ga%5FABC',
+    ) as $name ) {
+        $_SERVER['HTTP_COOKIE'] = '_ga=123; ' . $name . '=private'; $_COOKIE = array();
+        check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Unreviewed or personalizing cookie still bypasses: ' . $name );
+    }
+    foreach ( array(
+        ' ', '_ga', '_ga=1;', ';_ga=1', '_ga=1;;_gid=2', '_ga=1; _ga=2', '_ga =1',
+        '_ga="quoted"', '_ga=two words', '_ga=1,_gid=2', '_ga=back\\slash', "_ga=1\n", "_ga=1\r", "_ga=\x00",
+        '_ga[private]=1', '_ga=1; =2', '_ga=1; $Path=/',
+    ) as $raw ) {
+        $_SERVER['HTTP_COOKIE'] = $raw; $_COOKIE = array();
+        check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Malformed or ambiguous raw cookie list bypasses' );
+    }
+    $_SERVER['HTTP_COOKIE'] = '_ga.extra=1'; $_COOKIE = array( '_ga_extra' => '1' );
+    check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'PHP-normalized dotted name cannot enter the allowlist' );
+    $_SERVER['HTTP_COOKIE'] = '_ga=1'; $_COOKIE = array( '_ga' => array( 'private' => '1' ) );
+    check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Parsed cookie arrays remain private' );
+    $_SERVER['HTTP_COOKIE'] = '_ga=1'; $_COOKIE = array( '_ga' => '1', '_gid' => '2' );
+    check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Parsed names must also occur in the raw header' );
+    unset( $_SERVER['HTTP_COOKIE'] ); $_COOKIE = array( '_ga' => '1' );
+    check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Without a raw header PHP-normalized cookies are not trusted' );
+    $_COOKIE = array();
+    foreach ( array( 'no-cache', 'no-store', 'private', 'max-age=0', 'max-age=000', 'max-age="0"',
+        'public, max-age=0', 'max-age=300, no-cache', 'NO-CACHE', 'no-cache="set-cookie"' ) as $control ) {
+        $_SERVER['HTTP_CACHE_CONTROL'] = $control;
+        check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Explicit request cache-control remains a veto: ' . $control );
+    }
+    $_SERVER['HTTP_CACHE_CONTROL'] = 'max-age=60';
+    check( $worker->cache_policy() === 'public,max-age=300', 'Positive request max-age is not a privacy veto' );
+    unset( $_SERVER['HTTP_CACHE_CONTROL'] ); $_SERVER['HTTP_PRAGMA'] = 'no-cache';
+    check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Legacy explicit no-cache request remains private' );
+    unset( $_SERVER['HTTP_PRAGMA'] ); $_SERVER['HTTP_RANGE'] = 'bytes=0-20';
+    check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Partial-content request bypasses shared page caching' );
+    unset( $_SERVER['HTTP_RANGE'] );
     $_SERVER['REQUEST_METHOD'] = 'POST'; check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'POST bypass' ); $_SERVER['REQUEST_METHOD'] = 'GET';
     define( 'LSCWP_V', 'test' );
     check( $worker->cache_policy() === 'public,max-age=300', 'Installed LSCWP without active page cache does not disable fallback' );

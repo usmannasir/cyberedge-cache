@@ -3,7 +3,7 @@
  * Plugin Name: CyberEdge Cache
  * Plugin URI: https://github.com/usmannasir/cyberedge-cache
  * Description: Durable site purge delivery to CyberEdge and conservative public page cache signals.
- * Version: 0.4.4
+ * Version: 0.4.5
  * Requires at least: 6.2
  * Requires PHP: 7.4
  * Author: CyberPanel
@@ -198,6 +198,10 @@ final class CyberEdge_Cache {
     private $lscache_purge_queued = false;
     private $admin_page_hook = '';
     private $worker_woken = false;
+    private $cache_headers_started = false;
+    private $finalizer_registered = false;
+    private $response_private_veto = false;
+    private $response_ttl_ceiling = null;
 
     public function __construct( $outbox, $config = null, $http = 'wp_remote_post', $clock = 'time' ) {
         $this->outbox = $outbox;
@@ -237,6 +241,8 @@ final class CyberEdge_Cache {
         add_filter( 'cron_schedules', array( $this, 'schedules' ) );
         add_action( 'init', array( $this, 'ensure_schedule' ) );
         add_action( 'template_redirect', array( $this, 'cache_headers' ), PHP_INT_MAX );
+        add_action( 'wp_loaded', array( $this, 'register_header_finalizer' ), PHP_INT_MAX );
+        add_filter( 'litespeed_buffer_after', array( $this, 'finalize_litespeed_buffer' ), PHP_INT_MAX );
         add_filter( 'rest_post_dispatch', array( $this, 'rest_headers' ), PHP_INT_MAX, 3 );
         add_action( 'admin_notices', array( $this, 'admin_notice' ) );
         add_action( 'admin_menu', array( $this, 'admin_menu' ) );
@@ -380,20 +386,81 @@ final class CyberEdge_Cache {
         return wp_schedule_event( time() + 60, 'cyberedge_minute', self::CRON ) !== false;
     }
 
+    /** Only these analytics identifiers are independent of the public HTML. */
+    private static function public_analytics_cookie_name( $name ) {
+        return is_string( $name ) && preg_match( '/\A(?:_ga|_gid|_gat|_gcl_au|_fbp|_ga_[A-Za-z0-9]+|_gat_[A-Za-z0-9]+)\z/D', $name ) === 1;
+    }
+
+    private static function private_request_cookies() {
+        $raw = $_SERVER['HTTP_COOKIE'] ?? '';
+        if ( ! is_string( $raw ) ) { return true; }
+        if ( $raw === '' ) { return ! empty( $_COOKIE ); }
+        $seen = array();
+        foreach ( explode( ';', $raw ) as $part ) {
+            $part = trim( $part, " \t" );
+            $separator = strpos( $part, '=' );
+            if ( $separator === false ) { return true; }
+            $name = substr( $part, 0, $separator );
+            $value = substr( $part, $separator + 1 );
+            // Validate the original names before PHP replaces dots/spaces with
+            // underscores. Reject duplicate, quoted, or malformed cookie pairs.
+            if ( ! self::public_analytics_cookie_name( $name ) || isset( $seen[$name] ) ||
+                preg_match( '/\A[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]*\z/D', $value ) !== 1 ) {
+                return true;
+            }
+            $seen[$name] = true;
+        }
+        foreach ( $_COOKIE as $name => $value ) {
+            if ( ! self::public_analytics_cookie_name( $name ) || ! isset( $seen[$name] ) || ! is_string( $value ) ) { return true; }
+        }
+        return false;
+    }
+
+    private static function request_cache_veto() {
+        $control = $_SERVER['HTTP_CACHE_CONTROL'] ?? '';
+        $pragma = $_SERVER['HTTP_PRAGMA'] ?? '';
+        if ( ! is_string( $control ) || ! is_string( $pragma ) ) { return true; }
+        return preg_match( '/(?:\A|,)\s*(?:no-cache|no-store|private)(?:\s*(?:=|,|\z))/i', $control ) === 1 ||
+            preg_match( '/(?:\A|,)\s*max-age\s*=\s*"?0+"?\s*(?:,|\z)/i', $control ) === 1 ||
+            preg_match( '/(?:\A|,)\s*no-cache\s*(?:=|,|\z)/i', $pragma ) === 1;
+    }
+
+    private static function response_cache_ttl( $value, $native ) {
+        $ages = array(); $shared = array();
+        foreach ( explode( ',', $value ) as $directive ) {
+            if ( ! preg_match( '/\A\s*(max-age|s-maxage)\b(.*)\z/i', $directive, $part ) ) { continue; }
+            if ( ! preg_match( '/\A\s*=\s*(?:([0-9]+)|"([0-9]+)")\s*\z/', $part[2], $age ) ) { return 0; }
+            $number = (int) ( $age[1] !== '' ? $age[1] : $age[2] );
+            if ( strcasecmp( $part[1], 's-maxage' ) === 0 ) { $shared[] = $number; }
+            else { $ages[] = $number; }
+        }
+        $values = $native ? array_merge( $ages, $shared ) : ( $shared ?: $ages );
+        return $values ? min( $values ) : null;
+    }
+
     /** Edge policy remains explicit even when the origin also runs LSCWP. */
     public function cache_policy() {
         $status = http_response_code();
         if ( $status !== false && $status !== 200 ) { return 'private,no-cache,no-store'; }
+        $ttl = defined( 'CYBEREDGE_CACHE_TTL' ) ? (int) CYBEREDGE_CACHE_TTL : 300;
+        if ( $ttl <= 0 ) { return 'no-cache,no-store'; }
+        $ttl = min( 3600, $ttl );
         foreach ( headers_list() as $header ) {
+            if ( preg_match( '/\A(X-LiteSpeed-Cache-Control|Cache-Control):\s*(.*)\z/i', $header, $control ) ) {
+                $origin_ttl = self::response_cache_ttl( $control[2], strcasecmp( $control[1], 'X-LiteSpeed-Cache-Control' ) === 0 );
+                if ( $origin_ttl === 0 ) { return 'private,no-cache,no-store'; }
+                if ( $origin_ttl !== null ) { $ttl = min( $ttl, $origin_ttl ); }
+            }
             if ( stripos( $header, 'Set-Cookie:' ) === 0 ||
                 ( preg_match( '/^(?:X-LiteSpeed-Cache-Control|Cache-Control):/i', $header ) && preg_match( '/\b(?:private|no-cache|no-store)\b|esi\s*=\s*on/i', $header ) ) ||
                 ( stripos( $header, 'Content-Type:' ) === 0 && stripos( $header, 'text/html' ) === false ) ||
+                stripos( $header, 'X-LiteSpeed-Vary:' ) === 0 ||
                 ( stripos( $header, 'Vary:' ) === 0 && preg_match( '/\A\s*accept-encoding\s*\z/i', substr( $header, 5 ) ) !== 1 ) ) {
                 return 'private,no-cache,no-store';
             }
         }
         if ( ! in_array( $_SERVER['REQUEST_METHOD'] ?? '', array( 'GET', 'HEAD' ), true ) ||
-            ! empty( $_COOKIE ) || ! empty( $_SERVER['HTTP_COOKIE'] ) || ! empty( $_SERVER['HTTP_AUTHORIZATION'] ) ||
+            self::private_request_cookies() || self::request_cache_veto() || ! empty( $_SERVER['HTTP_RANGE'] ) || ! empty( $_SERVER['HTTP_AUTHORIZATION'] ) ||
             ! empty( $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ) || ! empty( $_SERVER['PHP_AUTH_USER'] ) ||
             ! empty( $_SERVER['QUERY_STRING'] ) || is_user_logged_in() || is_admin() ||
             is_preview() || is_search() || is_404() || is_feed() || is_trackback() || post_password_required() ||
@@ -403,13 +470,13 @@ final class CyberEdge_Cache {
             ( defined( 'DONOTCACHEPAGE' ) && DONOTCACHEPAGE ) ) {
             return 'private,no-cache,no-store';
         }
-        $ttl = defined( 'CYBEREDGE_CACHE_TTL' ) ? (int) CYBEREDGE_CACHE_TTL : 300;
-        return $ttl > 0 ? 'public,max-age=' . min( 3600, $ttl ) : 'no-cache,no-store';
+        return 'public,max-age=' . $ttl;
     }
 
     public function cache_headers() {
         try { $this->configuration(); } catch ( Throwable $error ) { return; }
-        $policy = $this->cache_policy();
+        $this->cache_headers_started = true;
+        $policy = $this->retain_cache_limits( $this->cache_policy() );
         if ( $policy === null ) { return; }
         if ( strpos( $policy, 'no-store' ) !== false ) { do_action( 'litespeed_control_set_nocache', 'CyberEdge private request' ); }
         if ( ! headers_sent() ) {
@@ -423,6 +490,49 @@ final class CyberEdge_Cache {
                 header( 'Cache-Control: public,max-age=0,s-maxage=' . $match[1], true );
             }
         }
+    }
+
+    public function register_header_finalizer() {
+        if ( $this->finalizer_registered ) { return; }
+        $this->finalizer_registered = true;
+        // LSCWP registers its shutdown priority-zero header output during init.
+        // Register afterwards, but before WordPress's priority-one buffer flush.
+        add_action( 'shutdown', array( $this, 'finalize_cache_headers' ), 0 );
+    }
+
+    public function finalize_cache_headers() {
+        if ( ! $this->cache_headers_started || headers_sent() ) { return; }
+        $policy = $this->retain_cache_limits( $this->cache_policy() );
+        if ( preg_match( '/\Apublic,max-age=([0-9]+)\z/', $policy, $age ) ) {
+            // cache_policy takes the minimum of every existing lifetime and
+            // the configured ceiling; a late shorter lifetime can only lower it.
+            header( 'Cache-Control: public,max-age=0,s-maxage=' . $age[1], true );
+            return;
+        }
+        if ( strpos( $policy, 'no-store' ) === false ) { return; }
+        // Never promote a response here. A late LSCWP decision, Set-Cookie,
+        // Vary, or application veto must survive an origin cache's internal
+        // header consumption as a standard shared-cache prohibition.
+        header( 'X-LiteSpeed-Cache-Control: private,no-cache,no-store', true );
+        header( 'Cache-Control: private,no-cache,no-store', true );
+    }
+
+    private function retain_cache_limits( $policy ) {
+        if ( strpos( $policy, 'no-store' ) !== false ) { $this->response_private_veto = true; }
+        if ( $this->response_private_veto ) { return 'private,no-cache,no-store'; }
+        if ( preg_match( '/\Apublic,max-age=([0-9]+)\z/', $policy, $age ) ) {
+            $ttl = (int) $age[1];
+            $this->response_ttl_ceiling = $this->response_ttl_ceiling === null ? $ttl : min( $ttl, $this->response_ttl_ceiling );
+            return 'public,max-age=' . $this->response_ttl_ceiling;
+        }
+        return $policy;
+    }
+
+    public function finalize_litespeed_buffer( $buffer ) {
+        // LSCWP's output-buffer path finalizes its own headers before this
+        // official filter. Preserve the buffer and all application callbacks.
+        $this->finalize_cache_headers();
+        return $buffer;
     }
 
     /** REST skips template_redirect; also covers a customized REST URL prefix. */
@@ -455,11 +565,12 @@ final class CyberEdge_Cache {
 
     public function admin_assets( $hook ) {
         if ( $hook !== $this->admin_page_hook ) { return; }
-        wp_enqueue_style( 'cyberedge-cache-admin', plugins_url( 'assets/admin.css', __FILE__ ), array(), '0.4.4' );
-        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.4.4', true );
+        wp_enqueue_style( 'cyberedge-cache-admin', plugins_url( 'assets/admin.css', __FILE__ ), array(), '0.4.5' );
+        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.4.5', true );
         wp_localize_script( 'cyberedge-cache-admin', 'CyberEdgeCacheAdmin', array(
             'homeUrl' => home_url( '/' ),
             'cacheHeader' => 'X-CyberEdge-Cache',
+            'cacheReasonHeader' => 'X-CyberEdge-Cache-Reason',
         ) );
     }
 

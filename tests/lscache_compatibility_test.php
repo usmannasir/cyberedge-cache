@@ -33,6 +33,8 @@ try {
     $conf = contract_file( $root, 'src/conf.cls.php' );
     $core = contract_file( $root, 'src/core.cls.php' );
     $purge = contract_file( $root, 'src/purge.cls.php' );
+    $control = contract_file( $root, 'src/control.cls.php' );
+    $vary = contract_file( $root, 'src/vary.cls.php' );
 
     contract_check( preg_match( '/^[ \t*#\/]*Version:\s*([0-9.]+)/mi', $bootstrap, $match ) === 1, 'plugin version header is readable' );
     $version = $match[1];
@@ -58,6 +60,26 @@ try {
         strpos( $core, "add_action( 'shutdown', [ \$this, 'send_headers' ], 0 )" ) !== false &&
         strpos( $core, 'Purge::output()' ) !== false,
         'final purge output is assembled during the response lifecycle'
+    );
+    contract_check(
+        strpos( $control, 'Base::O_CACHE_EXC_COOKIES' ) !== false &&
+        strpos( $control, 'array_intersect( array_keys( $_COOKIE ), $excludes )' ) !== false,
+        'cookie exclusions are configured names, not a blanket cookie veto'
+    );
+    contract_check(
+        strpos( $vary, "apply_filters( 'litespeed_vary_curr_cookies', \$cookies )" ) !== false &&
+        strpos( $vary, "'cookie=' . \$v" ) !== false,
+        'custom cookie variants must remain separate from a plain shared page'
+    );
+    contract_check(
+        strpos( $vary, "Control::set_nocache( 'password protected vary' )" ) !== false,
+        'password-protected content retains a no-cache veto'
+    );
+    contract_check(
+        strpos( $core, '$this->send_headers( true );' ) !== false &&
+        strpos( $core, '$this->send_headers( true );' ) < strpos( $core, "apply_filters( 'litespeed_buffer_after', \$buffer )" ) &&
+        strpos( $core, "apply_filters( 'litespeed_buffer_after', \$buffer )" ) !== false,
+        'the final buffer filter follows LiteSpeed final response headers'
     );
 
     echo json_encode( array( 'passed' => $checks, 'lscache_version' => $version ) ) . "\n";

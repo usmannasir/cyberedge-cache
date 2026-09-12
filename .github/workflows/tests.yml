@@ -29,10 +29,16 @@ jobs:
           php -l tests/outbox_test.php
           php -l tests/connection_test.php
           php -l tests/lscache_compatibility_test.php
+          php -l tests/cache_headers_http_test.php
       - name: Run isolated behavior suite
         run: |
           php tests/outbox_test.php
           php tests/connection_test.php
+          php tests/cache_headers_http_test.php
+      - name: Check dashboard status behavior
+        run: |
+          node --check cyberedge-cache/assets/admin.js
+          node tests/admin_status_test.js
       - name: Check audited LiteSpeed Cache contract
         run: |
           git clone --quiet https://github.com/litespeedtech/lscache_wp.git /tmp/lscache-audited
