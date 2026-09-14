@@ -132,7 +132,7 @@ try {
     check( wp_next_scheduled( CyberEdge_Cache::CRON ) !== false, 'Activation schedules the retry worker' );
     check( isset( WP_CLI::$commands['cyberedge deliver'], WP_CLI::$commands['cyberedge purge'] ), 'CLI commands registered' );
     check( isset( $hooks['admin_menu'], $hooks['admin_enqueue_scripts'], $hooks['admin_bar_menu'],
-        $hooks['admin_post_cyberedge_purge'], $hooks['admin_post_cyberedge_connect_start'],
+        $hooks['admin_post_cyberedge_purge'], $hooks['admin_post_cyberedge_cache_toggle'], $hooks['admin_post_cyberedge_connect_start'],
         $hooks['admin_post_cyberedge_connect_callback'], $hooks['admin_post_nopriv_cyberedge_connect_callback'],
         $hooks['site_status_tests'] ), 'Dashboard, pairing, manual purge, and Site Health hooks registered' );
     do_action( 'admin_menu' );
@@ -149,7 +149,8 @@ try {
     check( $bar->nodes[0]['href'] === 'https://example.test/wp-admin/tools.php?page=cyberedge-cache', 'Admin bar opens the CyberEdge dashboard' );
     ob_start(); $GLOBALS['cyberedge_cache']->status_page(); $dashboard = ob_get_clean();
     check( strpos( $dashboard, 'Live cache status' ) !== false && strpos( $dashboard, 'View bandwidth usage' ) !== false &&
-        strpos( $dashboard, 'Purge CyberEdge cache worldwide' ) !== false, 'Dashboard exposes cache, bandwidth, and purge journeys' );
+        strpos( $dashboard, 'Purge CyberEdge cache worldwide' ) !== false && strpos( $dashboard, 'Disable CyberEdge page caching' ) !== false,
+        'Dashboard exposes cache state, bandwidth, and purge journeys' );
     check( strpos( $dashboard, CYBEREDGE_PURGE_SECRET ) === false && strpos( $dashboard, CYBEREDGE_CONTROLLER_URL ) === false,
         'Dashboard never renders controller credentials' );
     $health = $GLOBALS['cyberedge_cache']->site_health();
@@ -268,6 +269,10 @@ try {
     check( $rejected, 'Site ID length matches the controller contract' );
     $_SERVER = array( 'REQUEST_METHOD' => 'GET' ); $_COOKIE = array();
     check( $worker->cache_policy() === 'public,max-age=300', 'Anonymous fallback uses bounded public TTL' );
+    update_option( CyberEdge_Cache::CACHE_OPTION, '0', false );
+    check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'WordPress administrator switch fails closed to private no-store' );
+    update_option( CyberEdge_Cache::CACHE_OPTION, '1', false );
+    check( $worker->cache_policy() === 'public,max-age=300', 'WordPress administrator switch can resume eligible public caching' );
     http_response_code( 403 ); check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Non-success status bypass' ); http_response_code( 200 );
     foreach ( array( 'logged_in', 'admin', 'preview', 'search', '404', 'feed', 'password', 'ajax', 'cart', 'checkout', 'account' ) as $flag ) {
         $flags[$flag] = true;
@@ -278,12 +283,15 @@ try {
         $_SERVER[$header] = 'test'; check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Bypass request input: ' . $header ); unset( $_SERVER[$header] );
     }
     $_COOKIE['woocommerce_items_in_cart'] = '1'; check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'WooCommerce cart cookie bypass' ); $_COOKIE = array();
-    foreach ( array( '_ga', '_gid', '_gat', '_gcl_au', '_fbp', '_ga_ABC123', '_gat_abc123' ) as $name ) {
+    foreach ( array( '_ga', '_gid', '_gat', '_gcl_au', '_fbp', '_ga_ABC123', '_gat_abc123',
+        'sbjs_current', 'sbjs_current_add', 'sbjs_first', 'sbjs_first_add', 'sbjs_migrations', 'sbjs_session', 'sbjs_udata' ) as $name ) {
         $_SERVER['HTTP_COOKIE'] = $name . '=GA1.1.123.456'; $_COOKIE = array( $name => 'GA1.1.123.456' );
         check( $worker->cache_policy() === 'public,max-age=300', 'Reviewed analytics cookie remains public: ' . $name );
     }
     foreach ( array(
         '_ga=GA1.1.123.456; _gid=GA1.1.321.654',
+        'sbjs_current=a; sbjs_current_add=b; sbjs_first=c; sbjs_first_add=d; sbjs_migrations=e; sbjs_session=f; sbjs_udata=g',
+        'sbjs_current=typ%3Dtypein%7C%7C%7Csrc%3D%28direct%29; _ga=123',
         "\t_ga=GA1.1.123.456 ;\t_gid=1\t", '_ga=', '_ga=value=with=equals',
     ) as $raw ) {
         $_SERVER['HTTP_COOKIE'] = $raw; $_COOKIE = array();
@@ -294,6 +302,7 @@ try {
         '_lscache_vary', 'woocommerce_items_in_cart', 'woocommerce_cart_hash', 'wp_woocommerce_session_hash',
         'PHPSESSID', 'custom_session', 'currency', 'language', 'consent', '_ga_custom_session',
         '_gat_custom_session', '_ga_', '_gat_', '_GA', '_ga.extra', '_ga extra', '_ga%5FABC',
+        'sbjs_promo', 'sbjs_private', 'sbjs_current_private', 'SBJS_SESSION', 'sbjs.current',
     ) as $name ) {
         $_SERVER['HTTP_COOKIE'] = '_ga=123; ' . $name . '=private'; $_COOKIE = array();
         check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Unreviewed or personalizing cookie still bypasses: ' . $name );
@@ -302,6 +311,9 @@ try {
         ' ', '_ga', '_ga=1;', ';_ga=1', '_ga=1;;_gid=2', '_ga=1; _ga=2', '_ga =1',
         '_ga="quoted"', '_ga=two words', '_ga=1,_gid=2', '_ga=back\\slash', "_ga=1\n", "_ga=1\r", "_ga=\x00",
         '_ga[private]=1', '_ga=1; =2', '_ga=1; $Path=/',
+        'sbjs_session=x;sbjs_session=y', 'sbjs_session="quoted"', 'sbjs_session=two words',
+        'sbjs_session=x; wp_woocommerce_session_hash=secret', 'sbjs_current=x; woocommerce_cart_hash=abc',
+        'sbjs_first=x; wordpress_logged_in_hash=secret', 'sbjs_udata=x; _lscache_vary=private',
     ) as $raw ) {
         $_SERVER['HTTP_COOKIE'] = $raw; $_COOKIE = array();
         check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Malformed or ambiguous raw cookie list bypasses' );

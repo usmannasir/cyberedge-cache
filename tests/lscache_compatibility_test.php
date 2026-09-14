@@ -38,6 +38,13 @@ try {
 
     contract_check( preg_match( '/^[ \t*#\/]*Version:\s*([0-9.]+)/mi', $bootstrap, $match ) === 1, 'plugin version header is readable' );
     $version = $match[1];
+    contract_check(
+        strpos( $api, "add_action( 'litespeed_purge', __NAMESPACE__ . '\\Purge::add' )" ) !== false &&
+        strpos( $purge, '$tags = [ $tags ];' ) !== false &&
+        strpos( $purge, '$tags = $this->_prepend_bid( $tags );' ) !== false &&
+        strpos( $purge, '$tags[] = LSWCP_TAG_PREFIX . $val;' ) !== false,
+        'public tag purge accepts a site/blog-prefixed root tag without invoking broad purge-all'
+    );
     contract_check( version_compare( $version, '7.9.1', '>=' ), 'tested version must be at least 7.9.1' );
     contract_check(
         strpos( $api, "add_action( 'litespeed_control_set_nocache', __NAMESPACE__ . '\\Control::set_nocache' )" ) !== false,

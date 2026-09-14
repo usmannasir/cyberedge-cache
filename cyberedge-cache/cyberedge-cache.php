@@ -3,7 +3,7 @@
  * Plugin Name: CyberEdge Cache
  * Plugin URI: https://github.com/usmannasir/cyberedge-cache
  * Description: Durable site purge delivery to CyberEdge and conservative public page cache signals.
- * Version: 0.4.5
+ * Version: 0.4.8
  * Requires at least: 6.2
  * Requires PHP: 7.4
  * Author: CyberPanel
@@ -15,6 +15,7 @@ defined( 'ABSPATH' ) || exit;
 
 final class CyberEdge_Config {
     const OPTION = 'cyberedge_connection_v1';
+    const HISTORY_OPTION = 'cyberedge_connection_history_v1';
     public $site_id;
     public $controller;
     private $secret;
@@ -40,7 +41,9 @@ final class CyberEdge_Config {
             if ( is_multisite() && ( ! defined( 'CYBEREDGE_BLOG_ID' ) || (int) CYBEREDGE_BLOG_ID !== get_current_blog_id() ) ) {
                 throw new InvalidArgumentException( 'CyberEdge must be configured separately for this WordPress site.' );
             }
-            return new self( CYBEREDGE_SITE_ID, CYBEREDGE_CONTROLLER_URL, CYBEREDGE_PURGE_SECRET );
+            $config = new self( CYBEREDGE_SITE_ID, CYBEREDGE_CONTROLLER_URL, CYBEREDGE_PURGE_SECRET );
+            self::remember_connection();
+            return $config;
         }
         if ( count( $defined ) ) {
             throw new InvalidArgumentException( 'CyberEdge server configuration is incomplete.' );
@@ -61,7 +64,32 @@ final class CyberEdge_Config {
         if ( ! is_array( $value ) || ! isset( $value['site_id'], $value['controller'], $value['secret'] ) ) {
             throw new InvalidArgumentException( 'The saved CyberEdge connection cannot be opened.' );
         }
-        return new self( $value['site_id'] ?? null, $value['controller'] ?? null, $value['secret'] ?? null );
+        $config = new self( $value['site_id'] ?? null, $value['controller'] ?? null, $value['secret'] ?? null );
+        self::remember_connection();
+        return $config;
+    }
+
+    public static function has_connection_history() {
+        $history = get_option( self::HISTORY_OPTION );
+        if ( $history === false ) { return false; }
+        if ( $history !== 'v1' ) { throw new RuntimeException( 'CyberEdge connection history is invalid.' ); }
+        return true;
+    }
+
+    /** Non-secret, retained setup history; losing credentials must not look new. */
+    public static function remember_connection() {
+        try {
+            if ( self::has_connection_history() ) { return; }
+            // Read back even after a successful write; false also means unchanged
+            // in WordPress, including another request recording this same marker.
+            update_option( self::HISTORY_OPTION, 'v1', false );
+            if ( ! self::has_connection_history() ) {
+                throw new RuntimeException( 'CyberEdge could not retain connection history.' );
+            }
+        } catch ( Throwable $error ) {
+            try { update_option( 'cyberedge_purge_enqueue_failed', 1, false ); } catch ( Throwable $ignored ) {}
+            throw new RuntimeException( 'CyberEdge could not verify its retained connection history.' );
+        }
     }
 
     public static function store( $site_id, $controller, $secret ) {
@@ -74,6 +102,9 @@ final class CyberEdge_Config {
         $key = hash( 'sha256', wp_salt( 'auth' ) . "\ncyberedge-connection-v1", true );
         $plaintext = wp_json_encode( array( 'site_id' => $config->site_id, 'controller' => $config->controller, 'secret' => $secret ) );
         $ciphertext = openssl_encrypt( $plaintext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $nonce, $tag, 'cyberedge-connection-v1' );
+        // Persist history before replacing a protected connection. A failed
+        // setup stays recoverable and cannot later be mistaken for a new site.
+        self::remember_connection();
         if ( $ciphertext === false || strlen( $tag ) !== 16 || ! update_option( self::OPTION, array(
             'version' => 1, 'nonce' => base64_encode( $nonce ), 'tag' => base64_encode( $tag ),
             'ciphertext' => base64_encode( $ciphertext ),
@@ -191,6 +222,7 @@ final class CyberEdge_Cache {
     const WAKE_CRON = 'cyberedge_deliver_purges_now';
     const PLATFORM = 'https://platform.cyberpersons.com';
     const CONNECT_TRANSIENT = 'cyberedge_connect_pending_v1';
+    const CACHE_OPTION = 'cyberedge_cache_enabled_v1';
     private $outbox;
     private $config;
     private $http;
@@ -211,7 +243,19 @@ final class CyberEdge_Cache {
     }
 
     private function configuration() {
+        if ( $this->config ) { CyberEdge_Config::remember_connection(); }
         return $this->config ?: CyberEdge_Config::load();
+    }
+
+    private function queue_status() {
+        $status = $this->outbox->status();
+        if ( ! is_array( $status ) || ! isset( $status['pending'] ) || ! is_int( $status['pending'] ) ||
+            $status['pending'] < 0 || ! array_key_exists( 'oldest', $status ) ||
+            ( $status['pending'] === 0 && $status['oldest'] !== null ) ||
+            ( $status['pending'] > 0 && ( ! is_int( $status['oldest'] ) || $status['oldest'] <= 0 || $status['oldest'] > time() ) ) ) {
+            throw new RuntimeException( 'CyberEdge queue status is inconsistent.' );
+        }
+        return $status;
     }
 
     public function register() {
@@ -249,6 +293,7 @@ final class CyberEdge_Cache {
         add_action( 'admin_enqueue_scripts', array( $this, 'admin_assets' ) );
         add_action( 'admin_bar_menu', array( $this, 'admin_bar' ), 100 );
         add_action( 'admin_post_cyberedge_purge', array( $this, 'manual_purge' ) );
+        add_action( 'admin_post_cyberedge_cache_toggle', array( $this, 'cache_toggle' ) );
         add_action( 'admin_post_cyberedge_connect_start', array( $this, 'connect_start' ) );
         add_action( 'admin_post_cyberedge_connect_callback', array( $this, 'connect_callback' ) );
         add_action( 'admin_post_nopriv_cyberedge_connect_callback', array( $this, 'connect_login' ) );
@@ -317,13 +362,22 @@ final class CyberEdge_Cache {
     }
 
     public function enqueue( $reason ) {
+        // WordPress and origin-cache hooks run before a first connection too.
+        // No edge destination exists yet; this is not a failed durable write.
+        // Never clear an existing alarm or ignore an invalid configured source.
         try {
+            if ( $this->config === null && ! CyberEdge_Config::managed_by_constants() &&
+                get_option( CyberEdge_Config::OPTION ) === false && ! CyberEdge_Config::has_connection_history() ) {
+                $status = $this->queue_status();
+                if ( $status['pending'] === 0 ) { return false; }
+                throw new RuntimeException( 'CyberEdge cannot treat a stranded or unreadable outbox as a new connection.' );
+            }
             // Do not deduplicate in request memory: another worker can finish before a later mutation.
             $id = $this->outbox->enqueue( $this->configuration(), $reason, call_user_func( $this->clock ) );
             $this->wake_worker();
             return $id;
         } catch ( Throwable $error ) {
-            update_option( 'cyberedge_purge_enqueue_failed', 1, false );
+            try { update_option( 'cyberedge_purge_enqueue_failed', 1, false ); } catch ( Throwable $ignored ) {}
             error_log( 'CyberEdge: unable to persist a purge. Check server configuration and the outbox database.' );
             return false;
         }
@@ -388,7 +442,10 @@ final class CyberEdge_Cache {
 
     /** Only these analytics identifiers are independent of the public HTML. */
     private static function public_analytics_cookie_name( $name ) {
-        return is_string( $name ) && preg_match( '/\A(?:_ga|_gid|_gat|_gcl_au|_fbp|_ga_[A-Za-z0-9]+|_gat_[A-Za-z0-9]+)\z/D', $name ) === 1;
+        // WooCommerce gathers these exact attribution values in JavaScript and
+        // submits them at checkout; they do not select public HTML or a cart.
+        // Never permit arbitrary sbjs_ prefixes or Woo session/login cookies.
+        return is_string( $name ) && preg_match( '/\A(?:_ga|_gid|_gat|_gcl_au|_fbp|_ga_[A-Za-z0-9]+|_gat_[A-Za-z0-9]+|sbjs_(?:current|current_add|first|first_add|migrations|session|udata))\z/D', $name ) === 1;
     }
 
     private static function private_request_cookies() {
@@ -440,6 +497,7 @@ final class CyberEdge_Cache {
 
     /** Edge policy remains explicit even when the origin also runs LSCWP. */
     public function cache_policy() {
+        if ( ! $this->cache_enabled() ) { return 'private,no-cache,no-store'; }
         $status = http_response_code();
         if ( $status !== false && $status !== 200 ) { return 'private,no-cache,no-store'; }
         $ttl = defined( 'CYBEREDGE_CACHE_TTL' ) ? (int) CYBEREDGE_CACHE_TTL : 300;
@@ -471,6 +529,13 @@ final class CyberEdge_Cache {
             return 'private,no-cache,no-store';
         }
         return 'public,max-age=' . $ttl;
+    }
+
+    /** Existing installations remain enabled; invalid persisted state fails closed. */
+    public function cache_enabled() {
+        if ( defined( 'CYBEREDGE_CACHE_ENABLED' ) ) { return CYBEREDGE_CACHE_ENABLED === true; }
+        $value = get_option( self::CACHE_OPTION );
+        return $value === false || $value === '1';
     }
 
     public function cache_headers() {
@@ -546,15 +611,35 @@ final class CyberEdge_Cache {
 
     public function admin_notice() {
         if ( ! current_user_can( 'manage_options' ) ) { return; }
-        try {
-            $this->configuration();
-            $status = $this->outbox->status();
-            $bad = get_option( 'cyberedge_purge_enqueue_failed' ) || ! wp_next_scheduled( self::CRON ) ||
-                ( $status['oldest'] !== null && time() - $status['oldest'] > 300 );
-        } catch ( Throwable $error ) { $bad = true; }
-        if ( $bad ) {
+        $local = $this->local_status();
+        if ( $local['bad'] ) {
             echo '<div class="notice notice-error"><p>CyberEdge needs attention. Open <a href="' . esc_url( admin_url( 'tools.php?page=cyberedge-cache' ) ) . '">Tools → CyberEdge Cache</a> to connect or inspect purge delivery. Cached pages may remain stale until their TTL expires.</p></div>';
+        } elseif ( $local['connection'] === 'disconnected' ) {
+            echo '<div class="notice notice-info"><p>Connect CyberEdge to start using Edge cache. Open <a href="' . esc_url( admin_url( 'tools.php?page=cyberedge-cache' ) ) . '">Tools → CyberEdge Cache</a> to sign in and finish setup.</p></div>';
         }
+    }
+
+    private function local_status() {
+        $connection = 'connected';
+        try { $this->configuration(); }
+        catch ( Throwable $error ) {
+            $connection = 'invalid';
+            try {
+                if ( $this->config === null && ! CyberEdge_Config::managed_by_constants() &&
+                    get_option( CyberEdge_Config::OPTION ) === false && ! CyberEdge_Config::has_connection_history() ) {
+                    $connection = 'disconnected';
+                }
+            } catch ( Throwable $ignored ) { /* Invalid or unreadable history is never a fresh installation. */ }
+        }
+        $status = null;
+        try { $status = $this->queue_status(); } catch ( Throwable $error ) { /* Never report an unreadable or inconsistent queue as empty. */ }
+        $scheduled = wp_next_scheduled( self::CRON ) !== false;
+        $enqueue_failed = (bool) get_option( 'cyberedge_purge_enqueue_failed' );
+        $bad = $connection === 'invalid' || $status === null || $enqueue_failed ||
+            ( $connection === 'connected' && ! $scheduled ) ||
+            ( $status !== null && ( ( $connection !== 'connected' && $status['pending'] > 0 ) ||
+                ( $status['oldest'] !== null && time() - $status['oldest'] > 300 ) ) );
+        return array( 'connection' => $connection, 'queue' => $status, 'scheduled' => $scheduled, 'enqueue_failed' => $enqueue_failed, 'bad' => (bool) $bad );
     }
 
     public function admin_menu() {
@@ -565,8 +650,8 @@ final class CyberEdge_Cache {
 
     public function admin_assets( $hook ) {
         if ( $hook !== $this->admin_page_hook ) { return; }
-        wp_enqueue_style( 'cyberedge-cache-admin', plugins_url( 'assets/admin.css', __FILE__ ), array(), '0.4.5' );
-        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.4.5', true );
+        wp_enqueue_style( 'cyberedge-cache-admin', plugins_url( 'assets/admin.css', __FILE__ ), array(), '0.4.8' );
+        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.4.8', true );
         wp_localize_script( 'cyberedge-cache-admin', 'CyberEdgeCacheAdmin', array(
             'homeUrl' => home_url( '/' ),
             'cacheHeader' => 'X-CyberEdge-Cache',
@@ -585,30 +670,53 @@ final class CyberEdge_Cache {
 
     public function status_page() {
         if ( ! current_user_can( 'manage_options' ) ) { wp_die( 'You are not allowed to manage CyberEdge Cache.' ); }
-        $status = array( 'pending' => 0, 'oldest' => null );
-        $configured = true;
-        try {
-            $this->configuration();
-            $status = $this->outbox->status();
-        } catch ( Throwable $error ) { $configured = false; }
-        $scheduled = wp_next_scheduled( self::CRON ) !== false;
-        $policy = 'CyberEdge sends an explicit edge policy for anonymous HTML and preserves every private or no-store veto.';
-        $message = isset( $_GET['cyberedge_purge'] ) ? (string) $_GET['cyberedge_purge'] : '';
-        echo '<div class="wrap cyberedge-admin"><header class="cyberedge-hero"><img src="' . esc_url( plugins_url( 'assets/cyberpanel-mark.svg', __FILE__ ) ) . '" alt="" width="56" height="56"><div><span>CYBERPANEL EDGE</span><h1>CyberEdge Cache</h1><p>Cache health, delivery status, and safe worldwide invalidation for this WordPress site.</p></div></header>';
-        if ( $message === 'queued' ) { echo '<div class="notice notice-success"><p>A worldwide cache purge is queued.</p></div>'; }
+        $local = $this->local_status();
+        $configured = $local['connection'] === 'connected';
+        $cache_enabled = $this->cache_enabled();
+        $cache_managed = defined( 'CYBEREDGE_CACHE_ENABLED' );
+        $status = $local['queue'];
+        $scheduled = $local['scheduled'];
+        $connection_label = $configured ? 'Connected' : ( $local['bad'] ? 'Needs attention' : 'Not connected' );
+        $connection_detail = $configured ? 'Your private site connection is saved.' :
+            ( $local['bad'] ? 'Review the connection and delivery checks below.' : 'Connect this WordPress site to your Edge account to begin.' );
+        $policy = $configured && $cache_enabled ? 'CyberEdge sends an explicit edge policy for anonymous HTML and preserves every private or no-store veto.' :
+            ( $configured ? 'Edge page caching is disabled from WordPress. Requests receive a private no-store policy until it is enabled again.' :
+            'CyberEdge has not enabled its page-cache policy. Your existing origin cache settings remain in control.' );
+        $message = isset( $_GET['cyberedge_purge'] ) && is_string( $_GET['cyberedge_purge'] ) ? $_GET['cyberedge_purge'] : '';
+        echo '<div class="wrap cyberedge-admin"><header class="cyberedge-hero"><img src="' . esc_url( plugins_url( 'assets/cyberpanel-mark.svg', __FILE__ ) ) . '" alt="" width="56" height="56"><div><span>CYBERPANEL EDGE</span><h1>CyberEdge Cache</h1><p>Cache health, delivery status, and safe worldwide invalidation for this WordPress site.</p></div></header><hr class="wp-header-end">';
+        if ( $local['enqueue_failed'] ) {
+            echo '<div class="notice notice-error inline" role="alert"><p><strong>A previous purge write failed.</strong> Some content changes may have missed cache invalidation. This warning remains recorded until the failure is reviewed, even when the queue is empty and the worker is scheduled. A successful retry does not automatically clear it. Contact your server administrator or CyberPanel support to review and resolve the recorded failure.</p></div>';
+        }
+        if ( $configured && $message === 'queued' ) { echo '<div class="notice notice-success"><p>A worldwide cache purge is queued.</p></div>'; }
         if ( $message === 'failed' ) { echo '<div class="notice notice-error"><p>The purge could not be queued. Check the database and server configuration.</p></div>'; }
-        echo '<div class="cyberedge-grid">';
-        echo '<section class="cyberedge-card"><span class="cyberedge-card-label">CONNECTION</span><strong>' . ( $configured ? 'Ready' : 'Needs attention' ) . '</strong><p>Server-side site configuration is ' . ( $configured ? 'available.' : 'missing or invalid.' ) . '</p></section>';
+        $toggle_message = isset( $_GET['cyberedge_cache'] ) && is_string( $_GET['cyberedge_cache'] ) ? $_GET['cyberedge_cache'] : '';
+        if ( $toggle_message === 'enabled' ) { echo '<div class="notice notice-success"><p>CyberEdge page caching is enabled. A worldwide purge was queued before caching resumed.</p></div>'; }
+        if ( $toggle_message === 'disabled' ) { echo '<div class="notice notice-success"><p>CyberEdge page caching is disabled. A worldwide purge was queued.</p></div>'; }
+        if ( $toggle_message === 'disabled_purge_failed' ) { echo '<div class="notice notice-warning"><p>CyberEdge page caching is disabled, but the worldwide purge could not be queued. Existing cached responses may remain until their TTL expires.</p></div>'; }
+        if ( $toggle_message === 'failed' ) { echo '<div class="notice notice-error"><p>The cache setting could not be changed safely.</p></div>'; }
+        if ( ! $configured ) { $this->connection_panel( false ); }
+        echo '<div class="cyberedge-grid" id="cyberedge-delivery-status">';
+        echo '<section class="cyberedge-card"><span class="cyberedge-card-label">CONNECTION</span><strong>' . esc_html( $connection_label ) . '</strong><p>' . esc_html( $connection_detail ) . '</p></section>';
         echo '<section class="cyberedge-card"><span class="cyberedge-card-label">DELIVERY WORKER</span><strong>' . ( $scheduled ? 'Scheduled' : 'Not scheduled' ) . '</strong><p>Reliable purge delivery requires this worker plus the provisioned system timer.</p></section>';
-        echo '<section class="cyberedge-card"><span class="cyberedge-card-label">PURGE QUEUE</span><strong>' . esc_html( (string) $status['pending'] ) . '</strong><p>' . ( $status['oldest'] === null ? 'No events are waiting.' : 'Oldest event: ' . esc_html( (string) max( 0, time() - $status['oldest'] ) ) . ' seconds ago.' ) . '</p></section>';
-        echo '<section class="cyberedge-card"><span class="cyberedge-card-label">PAGE POLICY</span><strong>CyberEdge managed</strong><p>' . esc_html( $policy ) . '</p></section>';
-        echo '</div><div class="cyberedge-columns"><section class="cyberedge-panel"><h2>Live cache status</h2><p>Check the public home page without WordPress login cookies. A first MISS may warm the page; check again to confirm a HIT.</p><div class="cyberedge-live-row"><button type="button" class="button button-primary" id="cyberedge-check-cache">Check cache status</button><strong id="cyberedge-cache-result" class="cyberedge-result" aria-live="polite">Not checked</strong></div><p class="description">Reads the customer-facing <code>X-CyberEdge-Cache</code> response header. No controller credential is sent.</p></section>';
+        echo '<section class="cyberedge-card"><span class="cyberedge-card-label">PURGE QUEUE</span><strong>' . ( $status === null ? 'Unavailable' : esc_html( (string) $status['pending'] ) ) . '</strong><p>' . ( $status === null ? 'Queue status could not be read. Existing events are not assumed delivered.' : ( $status['oldest'] === null ? 'No events are waiting.' : 'Oldest event: ' . esc_html( (string) max( 0, time() - $status['oldest'] ) ) . ' seconds ago.' ) ) . '</p></section>';
+        echo '<section class="cyberedge-card"><span class="cyberedge-card-label">PAGE POLICY</span><strong>' . ( $configured ? ( $cache_enabled ? 'Enabled' : 'Disabled' ) : 'Waiting for connection' ) . '</strong><p>' . esc_html( $policy ) . '</p></section>';
+        echo '</div><div class="cyberedge-columns"><section class="cyberedge-panel"><h2>Live cache status</h2><p>' . ( $configured ? ( $cache_enabled ? 'Check the public home page without WordPress login cookies. A first MISS may warm the page; check again to confirm a HIT.' : 'Caching is disabled. The public check should report a safe BYPASS after the worldwide purge reaches the edge.' ) : 'Connect this site first. Then check the public page without WordPress login cookies.' ) . '</p><div class="cyberedge-live-row"><button type="button" class="button button-primary" id="cyberedge-check-cache"' . ( $configured ? '' : ' disabled' ) . '>Check cache status</button><strong id="cyberedge-cache-result" class="cyberedge-result" aria-live="polite">' . ( $configured ? 'Not checked' : 'Connect first' ) . '</strong></div><p class="description">Reads the customer-facing <code>X-CyberEdge-Cache</code> response header. No controller credential is sent.</p></section>';
         echo '<section class="cyberedge-panel"><h2>Bandwidth and domains</h2><p>Exact confirmed bandwidth, request usage, plan allowance, invoices, and per-domain serving state remain in your authenticated customer workspace.</p><a class="button button-secondary" href="https://platform.cyberpersons.com/edge/" target="_blank" rel="noopener noreferrer">View bandwidth usage →</a></section></div>';
         echo '<section class="cyberedge-panel cyberedge-purge"><h2>Purge worldwide</h2><p>Queue a durable whole-site purge after a deployment or when content must be invalidated immediately. Normal WordPress changes are already handled automatically.</p><form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
         echo '<input type="hidden" name="action" value="cyberedge_purge">';
         wp_nonce_field( 'cyberedge_purge' );
-        submit_button( 'Purge CyberEdge cache worldwide' );
+        submit_button( 'Purge CyberEdge cache worldwide', 'primary', 'submit', true, $configured ? null : array( 'disabled' => true ) );
         echo '</form><p class="description">No purge secret or controller credential is shown on this page.</p></section>';
+        echo '<section class="cyberedge-panel"><h2>Page caching</h2><p>' . ( $cache_enabled ? 'CyberEdge may cache eligible anonymous HTML. Personalized, logged-in, cart, checkout, and private responses still bypass shared caching.' : 'CyberEdge page caching is disabled by this WordPress site. Purge delivery and the saved connection remain available.' ) . ( $cache_managed ? ' This switch is enforced by the server configuration.' : '' ) . '</p><form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
+        echo '<input type="hidden" name="action" value="cyberedge_cache_toggle"><input type="hidden" name="mode" value="' . ( $cache_enabled ? 'disable' : 'enable' ) . '">';
+        wp_nonce_field( 'cyberedge_cache_toggle' );
+        submit_button( $cache_enabled ? 'Disable CyberEdge page caching' : 'Enable CyberEdge page caching', $cache_enabled ? 'secondary' : 'primary', 'submit', true, $configured && ! $cache_managed ? null : array( 'disabled' => true ) );
+        echo '</form><p class="description">Changing this setting queues one worldwide purge. It does not disconnect the domain or delete its configuration.</p></section>';
+        if ( $configured ) { $this->connection_panel( true, ! $local['bad'] ); }
+        echo '</div>';
+    }
+
+    private function connection_panel( $configured, $delivery_ready = false ) {
         echo '<section class="cyberedge-panel"><h2>' . ( $configured ? 'WordPress connection' : 'Connect to CyberEdge' ) . '</h2>';
         if ( CyberEdge_Config::managed_by_constants() ) {
             echo '<p>This site is managed by its server configuration. Contact the server administrator to change the connection.</p>';
@@ -618,8 +726,13 @@ final class CyberEdge_Cache {
             submit_button( $configured ? 'Reconnect to CyberEdge' : 'Connect to CyberEdge' );
             echo '</form>';
         }
-        if ( isset( $_GET['cyberedge_connected'] ) && $_GET['cyberedge_connected'] === 'yes' ) { echo '<p><strong>Connection complete.</strong> Automatic purge delivery is ready.</p>'; }
-        echo '</section></div>';
+        if ( $configured && ( ! $delivery_ready || ( isset( $_GET['cyberedge_connected'] ) &&
+            in_array( $_GET['cyberedge_connected'], array( 'yes', 'partial' ), true ) ) ) ) {
+            echo '<p role="status"><strong>Connection saved.</strong> ' . ( $delivery_ready ?
+                'Local delivery checks passed. This does not confirm worldwide purge completion.' :
+                'Purge delivery needs attention. Keep this saved connection. Review the <a href="#cyberedge-delivery-status">delivery worker and queue</a>, fix the reported issue, then use Purge worldwide to retry. Do not repeat account approval to repair delivery.' ) . '</p>';
+        }
+        echo '</section>';
     }
 
     private function base64url( $bytes ) {
@@ -630,38 +743,68 @@ final class CyberEdge_Cache {
         return self::CONNECT_TRANSIENT . '_' . (string) get_current_user_id();
     }
 
+    private function connection_failure( $message, $status = 400 ) {
+        $dashboard = admin_url( 'tools.php?page=cyberedge-cache' );
+        $html = '<h2>Connection not completed</h2><p>' . esc_html( $message ) . '</p>';
+        $html .= '<p>Return to CyberEdge Cache to review this site, or start a new secure connection attempt. A retry asks you to approve the site again; it does not replay the previous authorization code.</p>';
+        $html .= '<p><a href="' . esc_url( $dashboard ) . '">Back to CyberEdge Cache</a></p>';
+        if ( current_user_can( 'manage_options' ) && ! CyberEdge_Config::managed_by_constants() ) {
+            $html .= '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '"><input type="hidden" name="action" value="cyberedge_connect_start">';
+            // Never copy the failed callback URL or its one-time code into a referrer field.
+            $html .= wp_nonce_field( 'cyberedge_connect_start', '_wpnonce', false, false );
+            $html .= '<p><button type="submit" class="button button-primary">Retry connection</button></p></form>';
+        } elseif ( current_user_can( 'manage_options' ) ) {
+            $html .= '<p>This connection is managed by its server configuration. Contact the server administrator to change it.</p>';
+        } else {
+            $html .= '<p>Sign in as a WordPress administrator before retrying.</p>';
+        }
+        wp_die( $html, 'CyberEdge connection needs attention', array( 'response' => $status, 'back_link' => false ) );
+    }
+
     public function connect_start() {
-        if ( ! current_user_can( 'manage_options' ) ) { wp_die( 'You are not allowed to connect CyberEdge Cache.' ); }
-        if ( ( $_SERVER['REQUEST_METHOD'] ?? '' ) !== 'POST' ) { wp_die( 'Use the CyberEdge connection button.' ); }
+        if ( ! current_user_can( 'manage_options' ) ) { $this->connection_failure( 'You are not allowed to connect CyberEdge Cache.', 403 ); }
+        if ( ( $_SERVER['REQUEST_METHOD'] ?? '' ) !== 'POST' ) { $this->connection_failure( 'Use the CyberEdge connection button to start a new attempt.' ); }
         check_admin_referer( 'cyberedge_connect_start' );
-        if ( CyberEdge_Config::managed_by_constants() ) { wp_die( 'This site is managed by its server configuration.' ); }
+        if ( CyberEdge_Config::managed_by_constants() ) { $this->connection_failure( 'This site is managed by its server configuration.' ); }
         $site_url = home_url( '/' );
         $site = parse_url( $site_url );
         if ( ! $site || ( $site['scheme'] ?? '' ) !== 'https' || empty( $site['host'] ) || isset( $site['user'] ) || isset( $site['pass'] ) ) {
-            wp_die( 'CyberEdge one-click connection requires the WordPress home URL to use HTTPS.' );
+            $this->connection_failure( 'CyberEdge one-click connection requires the WordPress home URL to use HTTPS.' );
         }
         $callback = add_query_arg( 'action', 'cyberedge_connect_callback', admin_url( 'admin-post.php' ) );
         $verifier = $this->base64url( random_bytes( 32 ) );
         $state = $this->base64url( random_bytes( 32 ) );
         $pending = array( 'state' => $state, 'verifier' => $verifier, 'redirect_uri' => $callback, 'site_url' => $site_url );
-        set_transient( $this->connect_transient_key(), $pending, 10 * MINUTE_IN_SECONDS );
+        if ( ! set_transient( $this->connect_transient_key(), $pending, 10 * MINUTE_IN_SECONDS ) ) {
+            $this->connection_failure( 'WordPress could not save the temporary connection proof. Check your database or object cache before retrying; the platform handoff has not started.' );
+        }
         $url = add_query_arg( array(
             'state' => $state, 'code_challenge' => $this->base64url( hash( 'sha256', $verifier, true ) ),
             'code_challenge_method' => 'S256', 'site_url' => $site_url, 'redirect_uri' => $callback,
         ), self::PLATFORM . '/edge/wordpress/connect/' );
+        // Reduce setup questions by reporting the address of the web server
+        // executing WordPress. The platform independently validates that it is
+        // public and still proves HTTPS before any routing change.
+        $server_address = $_SERVER['SERVER_ADDR'] ?? '';
+        if ( is_string( $server_address ) && filter_var( $server_address, FILTER_VALIDATE_IP,
+            FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) !== false ) {
+            $url = add_query_arg( 'origin_ip', $server_address, $url );
+        }
         wp_redirect( $url );
         exit;
     }
 
     public function connect_callback() {
-        if ( ! current_user_can( 'manage_options' ) ) { wp_die( 'Sign in as a WordPress administrator to finish the CyberEdge connection.' ); }
+        if ( ! current_user_can( 'manage_options' ) ) { $this->connection_failure( 'Sign in as a WordPress administrator to finish the CyberEdge connection.', 403 ); }
         $pending = get_transient( $this->connect_transient_key() );
         $code = isset( $_GET['code'] ) ? wp_unslash( $_GET['code'] ) : '';
         $state = isset( $_GET['state'] ) ? wp_unslash( $_GET['state'] ) : '';
         $issuer = isset( $_GET['iss'] ) ? wp_unslash( $_GET['iss'] ) : '';
-        if ( ! is_array( $pending ) || ! preg_match( '/\A[A-Za-z0-9_-]{43}\z/', $code ) ||
+        if ( ! is_array( $pending ) || ! is_string( $pending['state'] ?? null ) || ! is_string( $pending['verifier'] ?? null ) ||
+            ! is_string( $pending['redirect_uri'] ?? null ) || ! is_string( $pending['site_url'] ?? null ) ||
+            ! is_string( $code ) || ! is_string( $state ) || ! is_string( $issuer ) || ! preg_match( '/\A[A-Za-z0-9_-]{43}\z/', $code ) ||
             ! hash_equals( $pending['state'], $state ) || $issuer !== self::PLATFORM ) {
-            wp_die( 'The CyberEdge connection expired or its security proof did not match. Start again.' );
+            $this->connection_failure( 'The CyberEdge connection expired or its security proof did not match.' );
         }
         $response = wp_remote_post( self::PLATFORM . '/edge/wordpress/exchange/', array(
             'timeout' => 10, 'redirection' => 0, 'sslverify' => true, 'blocking' => true, 'limit_response_size' => 8192,
@@ -670,20 +813,30 @@ final class CyberEdge_Cache {
         ) );
         $body = is_wp_error( $response ) ? null : json_decode( wp_remote_retrieve_body( $response ), true );
         if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) !== 200 || ! is_array( $body ) ) {
-            wp_die( 'CyberEdge could not confirm the connection. The code was not saved; start again.' );
+            $this->connection_failure( 'CyberEdge could not confirm the connection. The connection service may be temporarily unavailable, or the authorization code may have expired.' );
         }
         $site_host = strtolower( (string) ( parse_url( $pending['site_url'], PHP_URL_HOST ) ?: '' ) );
         if ( ( $body['domain'] ?? null ) !== $site_host || ! is_string( $body['dashboard_url'] ?? null ) ||
             strpos( $body['dashboard_url'], self::PLATFORM . '/edge/domains/' ) !== 0 ) {
-            wp_die( 'CyberEdge returned a connection for a different site.' );
+            $this->connection_failure( 'CyberEdge returned a connection for a different site. It was not saved.' );
         }
         try { CyberEdge_Config::store( $body['site_id'] ?? null, $body['controller_url'] ?? null, $body['purge_secret'] ?? null ); }
-        catch ( Throwable $error ) { wp_die( 'CyberEdge could not protect the site connection locally.' ); }
+        catch ( Throwable $error ) { $this->connection_failure( 'CyberEdge could not protect and save the site connection locally. Check WordPress Site Health and your database before retrying.' ); }
         delete_transient( $this->connect_transient_key() );
-        $this->outbox->install();
-        $this->ensure_schedule();
-        $this->enqueue( 'connected' );
-        wp_safe_redirect( add_query_arg( 'cyberedge_connected', 'yes', admin_url( 'tools.php?page=cyberedge-cache' ) ) );
+        $setup_ready = false;
+        try {
+            $this->outbox->install();
+            $scheduled = $this->ensure_schedule();
+            // Purge only the site-prefixed public root tag, not unrelated caches.
+            do_action( 'litespeed_purge', '' );
+            $queued = $this->enqueue( 'connected' );
+            $setup_ready = $scheduled && $queued && ! $this->local_status()['bad'];
+        } catch ( Throwable $error ) {
+            try { update_option( 'cyberedge_purge_enqueue_failed', 1, false ); } catch ( Throwable $ignored ) {}
+        }
+        // Credentials and the consumed proof stay saved. A local delivery
+        // failure needs repair/retry, never another exchange of this code.
+        wp_safe_redirect( add_query_arg( 'cyberedge_connected', $setup_ready ? 'yes' : 'partial', admin_url( 'tools.php?page=cyberedge-cache' ) ) );
         exit;
     }
 
@@ -691,8 +844,9 @@ final class CyberEdge_Cache {
         $code = isset( $_GET['code'] ) ? wp_unslash( $_GET['code'] ) : '';
         $state = isset( $_GET['state'] ) ? wp_unslash( $_GET['state'] ) : '';
         $issuer = isset( $_GET['iss'] ) ? wp_unslash( $_GET['iss'] ) : '';
-        if ( ! preg_match( '/\A[A-Za-z0-9_-]{43}\z/', $code ) || ! preg_match( '/\A[A-Za-z0-9_-]{43}\z/', $state ) || $issuer !== self::PLATFORM ) {
-            wp_die( 'The CyberEdge connection return is invalid. Start again from the plugin.' );
+        if ( ! is_string( $code ) || ! is_string( $state ) || ! is_string( $issuer ) ||
+            ! preg_match( '/\A[A-Za-z0-9_-]{43}\z/', $code ) || ! preg_match( '/\A[A-Za-z0-9_-]{43}\z/', $state ) || $issuer !== self::PLATFORM ) {
+            $this->connection_failure( 'The CyberEdge connection return is invalid.' );
         }
         // WordPress preserves this exact request as redirect_to and dispatches
         // the authenticated callback after the administrator signs in.
@@ -709,6 +863,39 @@ final class CyberEdge_Cache {
         exit;
     }
 
+    public function cache_toggle() {
+        if ( ! current_user_can( 'manage_options' ) ) { wp_die( 'You are not allowed to change CyberEdge Cache settings.' ); }
+        if ( ( $_SERVER['REQUEST_METHOD'] ?? '' ) !== 'POST' ) { wp_die( 'Use the CyberEdge Cache settings form.' ); }
+        check_admin_referer( 'cyberedge_cache_toggle' );
+        if ( defined( 'CYBEREDGE_CACHE_ENABLED' ) ) { wp_die( 'CyberEdge page caching is enforced by the server configuration.' ); }
+        $mode = isset( $_POST['mode'] ) && is_string( $_POST['mode'] ) ? wp_unslash( $_POST['mode'] ) : '';
+        if ( ! in_array( $mode, array( 'enable', 'disable' ), true ) ) { wp_die( 'The requested cache setting is invalid.' ); }
+        try { $this->configuration(); }
+        catch ( Throwable $error ) {
+            wp_safe_redirect( add_query_arg( 'cyberedge_cache', 'failed', admin_url( 'tools.php?page=cyberedge-cache' ) ) );
+            exit;
+        }
+        if ( $mode === 'enable' ) {
+            // Queue invalidation while still disabled, then resume only after its
+            // durable event exists. A failed write therefore remains fail-closed.
+            if ( ! $this->enqueue( 'cache_enabled' ) || ! update_option( self::CACHE_OPTION, '1', false ) && get_option( self::CACHE_OPTION ) !== '1' ) {
+                wp_safe_redirect( add_query_arg( 'cyberedge_cache', 'failed', admin_url( 'tools.php?page=cyberedge-cache' ) ) );
+                exit;
+            }
+            $state = 'enabled';
+        } else {
+            update_option( self::CACHE_OPTION, '0', false );
+            if ( get_option( self::CACHE_OPTION ) !== '0' ) {
+                $state = 'failed';
+            } else {
+                do_action( 'litespeed_control_set_nocache', 'CyberEdge page caching disabled' );
+                $state = $this->enqueue( 'cache_disabled' ) ? 'disabled' : 'disabled_purge_failed';
+            }
+        }
+        wp_safe_redirect( add_query_arg( 'cyberedge_cache', $state, admin_url( 'tools.php?page=cyberedge-cache' ) ) );
+        exit;
+    }
+
     public function site_health_tests( $tests ) {
         $tests['direct']['cyberedge_cache'] = array(
             'label' => 'CyberEdge Cache delivery',
@@ -718,14 +905,14 @@ final class CyberEdge_Cache {
     }
 
     public function site_health() {
-        $healthy = true;
-        try {
-            $this->configuration();
-            $status = $this->outbox->status();
-            $healthy = wp_next_scheduled( self::CRON ) !== false &&
-                ! get_option( 'cyberedge_purge_enqueue_failed' ) &&
-                ( $status['oldest'] === null || time() - $status['oldest'] <= 300 );
-        } catch ( Throwable $error ) { $healthy = false; }
+        $local = $this->local_status();
+        if ( $local['connection'] === 'disconnected' && ! $local['bad'] ) {
+            return array( 'label' => 'Connect CyberEdge to finish setup', 'status' => 'recommended',
+                'badge' => array( 'label' => 'CyberEdge Cache', 'color' => 'blue' ),
+                'description' => '<p>Open Tools → CyberEdge Cache to connect this site. Edge caching has not been enabled yet.</p>',
+                'test' => 'cyberedge_cache' );
+        }
+        $healthy = ! $local['bad'];
         return array(
             'label' => $healthy ? 'CyberEdge purge delivery is ready' : 'CyberEdge purge delivery needs attention',
             'status' => $healthy ? 'good' : 'critical',

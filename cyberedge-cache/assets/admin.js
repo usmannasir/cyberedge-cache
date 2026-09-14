@@ -5,16 +5,35 @@
   if (!button || !result || !window.CyberEdgeCacheAdmin) return;
 
   button.addEventListener('click', function () {
+    if (button.disabled) return;
     button.disabled = true;
+    if (typeof AbortController !== 'function' || typeof fetch !== 'function') {
+      result.className = 'cyberedge-result is-warning';
+      result.textContent = 'This browser cannot run a timed cache check. Update your browser and try again.';
+      button.disabled = false;
+      return;
+    }
     result.className = 'cyberedge-result is-checking';
-    result.textContent = 'Checking…';
+    result.textContent = 'Checking the public site… This can take up to 15 seconds.';
+    var controller = new AbortController();
+    var timedOut = false;
+    var timeout = setTimeout(function () {
+      timedOut = true;
+      controller.abort();
+    }, 15000);
     fetch(window.CyberEdgeCacheAdmin.homeUrl, {
       // CyberEdge deliberately does not cache HEAD responses, so use an
       // anonymous GET to exercise the same path a visitor actually receives.
       method: 'GET',
       credentials: 'omit',
-      redirect: 'follow'
+      redirect: 'follow',
+      signal: controller.signal
     }).then(function (response) {
+      if (!response.ok) {
+        result.className = 'cyberedge-result is-warning';
+        result.textContent = 'The public site returned HTTP ' + response.status + '. Check the site and try again; cache status could not be verified.';
+        return;
+      }
       var value = response.headers.get(window.CyberEdgeCacheAdmin.cacheHeader);
       if (!value) {
         result.className = 'cyberedge-result is-warning';
@@ -49,8 +68,9 @@
       }
     }).catch(function () {
       result.className = 'cyberedge-result is-warning';
-      result.textContent = 'Could not reach the public site';
+      result.textContent = timedOut ? 'The public-site check timed out after 15 seconds. Check your connection and try again.' : 'Could not reach the public site. Check your connection and try again.';
     }).then(function () {
+      clearTimeout(timeout);
       button.disabled = false;
     });
   });

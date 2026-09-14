@@ -4,7 +4,7 @@ Tags: cache, edge cache, cdn, litespeed, woocommerce
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 0.4.5
+Stable tag: 0.4.8
 License: GPLv3 or later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -47,6 +47,15 @@ Browser refresh can send a zero-max-age request, and DevTools Disable cache can 
 WordPress mutations synchronously create a durable local outbox event. A background worker sends signed events to the site's CyberEdge controller. Delivery retries reuse the same event identity until the controller provides a valid acknowledgement.
 
 == Changelog ==
+
+= 0.4.8 =
+* Let administrators disable or enable CyberEdge page caching without disconnecting the site.
+* Queue a worldwide purge on every cache-state change and fail closed when enabling cannot be recorded safely.
+
+= 0.4.7 =
+* Detect a public WordPress server address during one-click setup so the platform can prefill the origin without asking the customer.
+* Retain the conservative cache policy: private, unknown-cookie, authentication, cart and explicit no-cache requests still bypass.
+* Preserve LiteSpeed Cache and other origin-cache compatibility behavior added in the 0.4.6 release candidate.
 
 = 0.4.5 =
 * Permit narrowly reviewed analytics-only cookie requests while retaining private, unknown-cookie, malformed-cookie, and explicit no-cache safeguards at both origin and edge.

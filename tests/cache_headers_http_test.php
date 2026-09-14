@@ -7,7 +7,9 @@ if ( PHP_SAPI === 'cli-server' ) {
     define( 'CYBEREDGE_SITE_ID', 'header-test' );
     define( 'CYBEREDGE_CONTROLLER_URL', 'https://controller.example.test' );
     define( 'CYBEREDGE_PURGE_SECRET', str_repeat( 'test-only-', 5 ) );
-    $hooks = array();
+    $hooks = array(); $options = array();
+    function get_option( $name ) { return $GLOBALS['options'][$name] ?? false; }
+    function update_option( $name, $value, $autoload = null ) { $GLOBALS['options'][$name] = $value; return true; }
     function add_action( $hook, $callback, $priority = 10, $argc = 1 ) { $GLOBALS['hooks'][$hook][$priority][] = array( $callback, $argc ); }
     function add_filter( ...$args ) { add_action( ...$args ); }
     function do_action( $hook, ...$args ) {
@@ -103,6 +105,29 @@ try {
             }
             $checks++;
         }
+    }
+    $attribution = array( 'sbjs_current', 'sbjs_current_add', 'sbjs_first', 'sbjs_first_add', 'sbjs_migrations', 'sbjs_session', 'sbjs_udata' );
+    $cookie_cases = array();
+    foreach ( $attribution as $name ) { $cookie_cases[] = array( $name . '=source%3Ddirect', 'public', true ); }
+    $all = implode( '; ', array_map( function ( $name ) { return $name . '=source%3Ddirect'; }, $attribution ) );
+    $cookie_cases[] = array( $all, 'public', true );
+    $cookie_cases[] = array( $all . '; _ga=GA1.1.1.2', 'public', true );
+    foreach ( array( 'wp_woocommerce_session_x=secret', 'woocommerce_cart_hash=private', 'wordpress_logged_in_x=secret', '_lscache_vary=private', 'sbjs_promo=code', 'sbjs_session=duplicate' ) as $private_cookie ) {
+        $cookie_cases[] = array( $all . '; ' . $private_cookie, 'public', false );
+    }
+    $cookie_cases[] = array( 'sbjs_session="quoted"', 'public', false );
+    $cookie_cases[] = array( $all, 'application', false );
+    $cookie_cases[] = array( $all, 'vary-cookie', false );
+    foreach ( $cookie_cases as $case ) {
+        list( $cookie, $mode, $public ) = $case;
+        $http_response_header = array();
+        $body = file_get_contents( 'http://' . $address . '/' . $mode, false, stream_context_create( array( 'http' => array( 'timeout' => 3, 'header' => 'Cookie: ' . $cookie ) ) ) );
+        $controls = array_values( preg_grep( '/^Cache-Control:/i', $http_response_header ) );
+        $expected = $public ? 'Cache-Control: public,max-age=0,s-maxage=300' : 'Cache-Control: private,no-cache,no-store';
+        if ( $controls !== array( $expected ) || $body !== '<!doctype html><title>Public fixture</title>' ) {
+            throw new RuntimeException( 'Attribution request failed its actual HTTP policy contract' );
+        }
+        $checks++;
     }
     echo json_encode( array( 'passed' => $checks, 'transport' => 'PHP HTTP SAPI over loopback only' ) ) . "\n";
 } finally {
