@@ -4,7 +4,7 @@ Tags: cache, edge cache, cdn, litespeed, woocommerce
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 0.4.8
+Stable tag: 0.5.0
 License: GPLv3 or later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -47,6 +47,15 @@ Browser refresh can send a zero-max-age request, and DevTools Disable cache can 
 WordPress mutations synchronously create a durable local outbox event. A background worker sends signed events to the site's CyberEdge controller. Delivery retries reuse the same event identity until the controller provides a valid acknowledgement.
 
 == Changelog ==
+
+= 0.5.0 =
+* LSCache-compatible page tags (F, H, Po., PGS, T., A., PT., D., FD, HTTP.404, URL.) are sent to CyberEdge as X-CyberEdge-Tag.
+* Content changes purge only the affected pages worldwide (the post, its neighbours, home, front page, pages, feeds, author, post-type, term and date archives) instead of the whole site. Menus, themes, the customizer, widgets and upgrades still purge everything.
+* WooCommerce product, variation, stock and scheduled-sale changes purge that product and its listings.
+* LiteSpeed Cache's own purges map to the same precise tags.
+* Pages are kept for 10 hours by default (maximum 10 hours, below WordPress nonce lifetimes); WordPress 404 pages for one hour; feeds are cacheable.
+* Ad and campaign tracking parameters (utm_*, fbclid, gclid, msclkid, srsltid and WP Rocket's list) no longer make a page private.
+* More JavaScript-only analytics cookies (Clarity, Hotjar, Meta, Google Ads, Bing, TikTok, Pinterest, Matomo, Google One Tap, Cloudflare bot cookies) no longer make a page private.
 
 = 0.4.8 =
 * Let administrators disable or enable CyberEdge page caching without disconnecting the site.

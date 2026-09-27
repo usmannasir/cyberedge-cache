@@ -52,6 +52,16 @@ function wp_clear_scheduled_hook( $hook ) { unset( $GLOBALS['scheduled'][$hook] 
 function update_option( $name, $value, $autoload = null ) { $GLOBALS['options'][$name] = $value; }
 function get_option( $name ) { return $GLOBALS['options'][$name] ?? false; }
 function get_comment( $id ) { return $GLOBALS['comments'][$id] ?? null; }
+$posts = array();
+function get_post( $post ) { return is_object( $post ) ? $post : ( $GLOBALS['posts'][(int) $post] ?? null ); }
+function get_permalink( $post ) { return 'https://example.test/' . get_post( $post )->post_name . '/'; }
+function wp_make_link_relative( $link ) { return (string) parse_url( $link, PHP_URL_PATH ); }
+function trailingslashit( $value ) { return rtrim( $value, '/\\' ) . '/'; }
+function get_object_taxonomies( $type ) { return $type === 'post' ? array( 'category', 'post_tag' ) : array( 'product_cat' ); }
+function wp_get_object_terms( $id, $taxonomy, $args ) { return $GLOBALS['posts'][$id]->terms[$taxonomy] ?? array(); }
+function get_adjacent_post( $in_same_term, $excluded, $previous ) { return $previous ? ( $GLOBALS['posts'][$GLOBALS['post']->ID - 1] ?? null ) : null; }
+function get_term_by( $field, $value ) { return $field === 'term_taxonomy_id' ? (object) array( 'term_id' => $value + 1000 ) : null; }
+function wp_get_post_parent_id( $id ) { return $GLOBALS['posts'][$id]->post_parent ?? 0; }
 function wp_die( $message ) { throw new RuntimeException( $message ); }
 function esc_html( $value ) { return htmlspecialchars( $value ); }
 function current_user_can( $capability ) { return true; }
@@ -156,7 +166,7 @@ try {
     $health = $GLOBALS['cyberedge_cache']->site_health();
     check( $health['status'] === 'good' && $health['test'] === 'cyberedge_cache', 'Healthy local delivery is reported to Site Health' );
     $rest_response = new class {
-        public $headers = array( 'Cache-Control' => 'public,max-age=300' );
+        public $headers = array( 'Cache-Control' => 'public,max-age=36000' );
         public function header( $name, $value ) { $this->headers[$name] = $value; }
     };
     $rest_vetoes = 0;
@@ -166,17 +176,47 @@ try {
     check( $rest_response->headers['X-LiteSpeed-Cache-Control'] === 'private,no-cache,no-store', 'REST sets native cache veto' );
     check( $rest_vetoes === 1, 'REST notifies the active LiteSpeed plugin' );
 
+    $post_fields = array( 'post_type' => 'post', 'post_author' => 3, 'post_date' => '2026-09-20 10:00:00', 'post_status' => 'publish' );
+    $posts[8] = (object) ( array( 'ID' => 8, 'post_name' => 'older' ) + $post_fields );
+    $posts[9] = (object) ( array( 'ID' => 9, 'post_name' => 'hello', 'terms' => array( 'category' => array( 5 ), 'post_tag' => array( 7 ) ) ) + $post_fields );
+    $posts[20] = (object) array( 'ID' => 20, 'post_type' => 'product', 'post_name' => 'shoe', 'post_author' => 1,
+        'post_date' => '2026-01-02 00:00:00', 'post_status' => 'publish', 'terms' => array( 'product_cat' => array( 30 ) ) );
+    $posts[21] = (object) array( 'ID' => 21, 'post_type' => 'product_variation', 'post_parent' => 20 );
+    $expected = array( 'A.3', 'D.2026', 'D.202609', 'D.20260920', 'F', 'FD', 'H', 'PGS', 'PT.post', 'Po.8', 'Po.9', 'T.5', 'T.7',
+        'URL.' . md5( '/hello/' ) );
+    $tags = CyberEdge_Cache::post_tags( 9 ); sort( $tags );
+    check( $tags === $expected, 'A post purges exactly LSCache\'s default related pages: ' . json_encode( $tags ) );
+    $body_of_last = function () use ( $wpdb ) {
+        return json_decode( $wpdb->pdo->query( 'SELECT body FROM wp_cyberedge_purge_outbox ORDER BY rowid DESC LIMIT 1' )->fetchColumn(), true );
+    };
     $before = $outbox->status()['pending'];
-    do_action( 'transition_post_status', 'publish', 'future', (object) array( 'ID' => 1, 'post_type' => 'post' ) );
-    do_action( 'transition_post_status', 'publish', 'publish', (object) array( 'ID' => 1, 'post_type' => 'post' ) );
+    do_action( 'transition_post_status', 'publish', 'future', $posts[9] );
+    $event = $body_of_last();
+    check( $event['scope'] === 'tags' && $event['tags'] === $expected, 'Publishing a post queues one precise tag purge' );
+    do_action( 'transition_post_status', 'publish', 'publish', $posts[9] );
     do_action( 'transition_post_status', 'draft', 'draft', (object) array( 'ID' => 2, 'post_type' => 'post' ) );
     check( $outbox->status()['pending'] === $before + 2, 'Scheduled publication and edits purge; drafts do not' );
+    do_action( 'set_object_terms', 9, array(), array(), 'category', false, array( 4 ) );
+    check( in_array( 'T.1004', $body_of_last()['tags'], true ) && in_array( 'T.5', $body_of_last()['tags'], true ),
+        'Changing a post\'s terms also purges the archive it left' );
+    do_action( 'woocommerce_variation_set_stock', (object) array( 'id' => 21 ) );
+    $event = $body_of_last();
+    check( $event['scope'] === 'site', 'A product object without an ID purges the whole site' );
+    do_action( 'woocommerce_update_product', 21 );
+    $event = $body_of_last();
+    check( $event['scope'] === 'tags' && in_array( 'Po.20', $event['tags'], true ) && in_array( 'T.30', $event['tags'], true )
+        && in_array( 'PT.product', $event['tags'], true ), 'A variation purges its parent product and its listings' );
+    do_action( 'wc_after_products_ending_sales', array( 20, 9 ) );
+    $event = $body_of_last();
+    check( in_array( 'Po.20', $event['tags'], true ) && in_array( 'Po.9', $event['tags'], true ), 'Scheduled sale changes purge each product' );
     foreach ( array( 'wp_update_nav_menu', 'edited_term', 'upgrader_process_complete', 'automatic_updates_complete',
+        'switch_theme', 'customize_save_after', 'update_option_sidebars_widgets',
         'woocommerce_update_product', 'woocommerce_product_set_stock', 'woocommerce_variation_set_stock_status' ) as $hook ) {
         $before = $outbox->status()['pending']; do_action( $hook, 'ignored' );
-        check( $outbox->status()['pending'] === $before + 1, 'Durable event for ' . $hook );
+        check( $outbox->status()['pending'] === $before + 1 && $body_of_last()['scope'] === 'site',
+            'Durable whole-site event for ' . $hook );
     }
-    $approved = (object) array( 'comment_approved' => '1' );
+    $approved = (object) array( 'comment_approved' => '1', 'comment_post_ID' => 9 );
     $pending = (object) array( 'comment_approved' => '0' );
     $before = $outbox->status()['pending'];
     do_action( 'wp_insert_comment', 10, $pending );
@@ -189,18 +229,23 @@ try {
     do_action( 'deleted_comment', 14, $pending );
     do_action( 'deleted_comment', 15, $approved );
     check( $outbox->status()['pending'] === $before + 5, 'Only public comment changes enqueue purges' );
+    check( $body_of_last()['tags'] === $expected, 'A comment purges its post\'s pages precisely' );
     foreach ( array( 'litespeed_purge', 'litespeed_purge_url', 'litespeed_purged_all_lscache',
         'litespeed_purged_single', 'litespeed_purged_link' ) as $hook ) {
         check( ! isset( $hooks[$hook] ), 'No duplicate listener on overlapping LSCWP hook ' . $hook );
     }
     $before = $outbox->status()['pending'];
-    check( apply_filters( 'litespeed_purge_tags', array( 'original-tag' ), false ) === array( 'original-tag' ), 'LSCWP tag filter is unchanged' );
-    check( apply_filters( 'litespeed_purge_tags', array( 'second-tag' ), false ) === array( 'second-tag' ), 'Repeated LSCWP tag filter is unchanged' );
+    check( apply_filters( 'litespeed_purge_tags', array( 'a1b_Po.12', 'a1b2_F' ), false ) === array( 'a1b_Po.12', 'a1b2_F' ), 'LSCWP tag filter is unchanged' );
+    check( $body_of_last() ['tags'] === array( 'F', 'Po.12' ), 'LSCWP site-prefixed tags map to the same precise tags' );
+    apply_filters( 'litespeed_purge_tags', array( 'a1b_' ), false );
+    check( $body_of_last()['scope'] === 'site', 'LSCWP site root tag purges the whole site' );
+    apply_filters( 'litespeed_purge_tags', array( '*' ), false );
+    check( $body_of_last()['scope'] === 'site', 'LSCWP purge-all purges the whole site' );
     apply_filters( 'litespeed_purge_tags', array( 'private' ), true );
     apply_filters( 'litespeed_purge_tags', array(), false );
-    check( $outbox->status()['pending'] === $before + 1, 'One request queues one global fallback for public LSCWP tags' );
+    check( $outbox->status()['pending'] === $before + 3, 'Only public LSCWP purge sets queue events' );
     call_user_func( WP_CLI::$commands['cyberedge purge'] );
-    check( $outbox->status()['pending'] === $before + 2, 'WP-CLI persists without network' );
+    check( $outbox->status()['pending'] === $before + 4 && $body_of_last()['scope'] === 'site', 'WP-CLI persists a whole-site purge without network' );
     check( count( $http_calls ) === 0, 'No mutation or toolbar event calls HTTP' );
 
     // Reopen a separate connection to prove events persist outside the plugin/request instance.
@@ -227,7 +272,8 @@ try {
         check( $url === 'https://controller.example.test/v1/sites/site-test/purges', 'Correct scoped endpoint' );
         check( $args['redirection'] === 0 && $args['sslverify'] === true && $args['timeout'] === 5, 'Strict HTTPS and no redirects' );
         $body = json_decode( $args['body'], true );
-        check( array_keys( $body ) === array( 'event_id', 'scope' ) && $body['scope'] === 'site', 'Exact minimal controller contract' );
+        check( ( array_keys( $body ) === array( 'event_id', 'scope' ) && $body['scope'] === 'site' ) ||
+            ( array_keys( $body ) === array( 'event_id', 'scope', 'tags' ) && $body['scope'] === 'tags' ), 'Exact minimal controller contract' );
         $signature = hash_hmac( 'sha256', $args['headers']['X-CyberEdge-Timestamp'] . "\n" . $args['body'], CYBEREDGE_PURGE_SECRET );
         check( hash_equals( $signature, $args['headers']['X-CyberEdge-Signature'] ), 'Signature covers exact transmitted bytes' );
         check( strpos( json_encode( $args ), CYBEREDGE_PURGE_SECRET ) === false, 'Secret never transmitted' );
@@ -268,13 +314,31 @@ try {
     catch ( InvalidArgumentException $e ) { $rejected = true; }
     check( $rejected, 'Site ID length matches the controller contract' );
     $_SERVER = array( 'REQUEST_METHOD' => 'GET' ); $_COOKIE = array();
-    check( $worker->cache_policy() === 'public,max-age=300', 'Anonymous fallback uses bounded public TTL' );
+    check( $worker->cache_policy() === 'public,max-age=36000', 'Anonymous fallback uses bounded public TTL' );
     update_option( CyberEdge_Cache::CACHE_OPTION, '0', false );
     check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'WordPress administrator switch fails closed to private no-store' );
     update_option( CyberEdge_Cache::CACHE_OPTION, '1', false );
-    check( $worker->cache_policy() === 'public,max-age=300', 'WordPress administrator switch can resume eligible public caching' );
+    check( $worker->cache_policy() === 'public,max-age=36000', 'WordPress administrator switch can resume eligible public caching' );
     http_response_code( 403 ); check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Non-success status bypass' ); http_response_code( 200 );
-    foreach ( array( 'logged_in', 'admin', 'preview', 'search', '404', 'feed', 'password', 'ajax', 'cart', 'checkout', 'account' ) as $flag ) {
+    // Like LSCache: a real WordPress 404 is cached for an hour, feeds like pages.
+    $flags['404'] = true; http_response_code( 404 );
+    check( $worker->cache_policy() === 'public,max-age=3600', 'WordPress 404 is cacheable for one hour' );
+    $flags['404'] = false;
+    check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'A 404 status without WordPress 404 stays private' );
+    http_response_code( 200 );
+    $flags['feed'] = true;
+    check( $worker->cache_policy() === 'public,max-age=36000', 'Feeds are cacheable' );
+    $flags['feed'] = false;
+    foreach ( array( 'utm_source=news&utm_campaign=fall', 'fbclid=IwAR0&gclid=Cj0', 'srsltid=AfmB', 'hsa_acc=1&mtm_campaign=x' ) as $query ) {
+        $_SERVER['QUERY_STRING'] = $query; $_GET = array( 'x' => '1' );
+        check( $worker->cache_policy() === 'public,max-age=36000', 'Tracking-only query stays public: ' . $query );
+    }
+    foreach ( array( 'utm_source=a&page=2', 'p=12', 'utm_=1', '&', 'lang=en', 's=shoes' ) as $query ) {
+        $_SERVER['QUERY_STRING'] = $query;
+        check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Content query stays private: ' . $query );
+    }
+    unset( $_SERVER['QUERY_STRING'] ); $_GET = array();
+    foreach ( array( 'logged_in', 'admin', 'preview', 'search', 'password', 'ajax', 'cart', 'checkout', 'account' ) as $flag ) {
         $flags[$flag] = true;
         check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Private context bypass: ' . $flag );
         $flags[$flag] = false;
@@ -284,18 +348,20 @@ try {
     }
     $_COOKIE['woocommerce_items_in_cart'] = '1'; check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'WooCommerce cart cookie bypass' ); $_COOKIE = array();
     foreach ( array( '_ga', '_gid', '_gat', '_gcl_au', '_fbp', '_ga_ABC123', '_gat_abc123',
-        'sbjs_current', 'sbjs_current_add', 'sbjs_first', 'sbjs_first_add', 'sbjs_migrations', 'sbjs_session', 'sbjs_udata' ) as $name ) {
+        'sbjs_current', 'sbjs_current_add', 'sbjs_first', 'sbjs_first_add', 'sbjs_migrations', 'sbjs_session', 'sbjs_udata',
+        '_fbc', '_gcl_aw', '_clck', '_clsk', '_hjid', '_hjSessionUser_123', '_uetsid', '_ttp', '_pin_unauth', '_pk_id.1.1fff',
+        '__cf_bm', '_cfuvid', 'cf_clearance' ) as $name ) {
         $_SERVER['HTTP_COOKIE'] = $name . '=GA1.1.123.456'; $_COOKIE = array( $name => 'GA1.1.123.456' );
-        check( $worker->cache_policy() === 'public,max-age=300', 'Reviewed analytics cookie remains public: ' . $name );
+        check( $worker->cache_policy() === 'public,max-age=36000', 'Reviewed analytics cookie remains public: ' . $name );
     }
     foreach ( array(
         '_ga=GA1.1.123.456; _gid=GA1.1.321.654',
         'sbjs_current=a; sbjs_current_add=b; sbjs_first=c; sbjs_first_add=d; sbjs_migrations=e; sbjs_session=f; sbjs_udata=g',
         'sbjs_current=typ%3Dtypein%7C%7C%7Csrc%3D%28direct%29; _ga=123',
-        "\t_ga=GA1.1.123.456 ;\t_gid=1\t", '_ga=', '_ga=value=with=equals',
+        "\t_ga=GA1.1.123.456 ;\t_gid=1\t", '_ga=', '_ga=value=with=equals', 'g_state={"i_l":0}; _ga=1',
     ) as $raw ) {
         $_SERVER['HTTP_COOKIE'] = $raw; $_COOKIE = array();
-        check( $worker->cache_policy() === 'public,max-age=300', 'Strict analytics-only raw cookie list remains public' );
+        check( $worker->cache_policy() === 'public,max-age=36000', 'Strict analytics-only raw cookie list remains public' );
     }
     foreach ( array(
         'wordpress_logged_in_hash', 'wordpress_sec_hash', 'wp-postpass_hash', 'comment_author_hash',
@@ -333,7 +399,7 @@ try {
         check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Explicit request cache-control remains a veto: ' . $control );
     }
     $_SERVER['HTTP_CACHE_CONTROL'] = 'max-age=60';
-    check( $worker->cache_policy() === 'public,max-age=300', 'Positive request max-age is not a privacy veto' );
+    check( $worker->cache_policy() === 'public,max-age=36000', 'Positive request max-age is not a privacy veto' );
     unset( $_SERVER['HTTP_CACHE_CONTROL'] ); $_SERVER['HTTP_PRAGMA'] = 'no-cache';
     check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Legacy explicit no-cache request remains private' );
     unset( $_SERVER['HTTP_PRAGMA'] ); $_SERVER['HTTP_RANGE'] = 'bytes=0-20';
@@ -341,11 +407,11 @@ try {
     unset( $_SERVER['HTTP_RANGE'] );
     $_SERVER['REQUEST_METHOD'] = 'POST'; check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'POST bypass' ); $_SERVER['REQUEST_METHOD'] = 'GET';
     define( 'LSCWP_V', 'test' );
-    check( $worker->cache_policy() === 'public,max-age=300', 'Installed LSCWP without active page cache does not disable fallback' );
+    check( $worker->cache_policy() === 'public,max-age=36000', 'Installed LSCWP without active page cache does not disable fallback' );
     define( 'LITESPEED_ON', true );
-    check( $worker->cache_policy() === 'public,max-age=300', 'Active LSCWP still emits an explicit policy for the Edge reverse proxy' );
+    check( $worker->cache_policy() === 'public,max-age=36000', 'Active LSCWP still emits an explicit policy for the Edge reverse proxy' );
     define( 'LITESPEED_DISABLE_ALL', true );
-    check( $worker->cache_policy() === 'public,max-age=300', 'Disabled LSCWP page cache does not disable fallback' );
+    check( $worker->cache_policy() === 'public,max-age=36000', 'Disabled LSCWP page cache does not disable fallback' );
     $flags['checkout'] = true;
     check( strpos( $worker->cache_policy(), 'no-store' ) !== false, 'Woo private veto persists with LSCWP present' );
     echo json_encode( array( 'passed' => $test_count, 'database' => 'SQLite; production SQL DML unchanged', 'network_requests' => 0 ) ) . "\n";

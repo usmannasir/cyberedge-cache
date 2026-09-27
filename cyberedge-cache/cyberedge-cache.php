@@ -2,8 +2,8 @@
 /**
  * Plugin Name: CyberEdge Cache
  * Plugin URI: https://github.com/usmannasir/cyberedge-cache
- * Description: Durable site purge delivery to CyberEdge and conservative public page cache signals.
- * Version: 0.4.8
+ * Description: LSCache-compatible page caching on the CyberEdge network: tagged pages, precise durable purges and conservative public cache signals.
+ * Version: 0.5.0
  * Requires at least: 6.2
  * Requires PHP: 7.4
  * Author: CyberPanel
@@ -157,9 +157,11 @@ final class CyberEdge_Outbox {
         ) $collate;" );
     }
 
-    public function enqueue( $config, $reason, $now ) {
+    /** $tags null purges the whole site; a list purges only pages carrying a tag. */
+    public function enqueue( $config, $reason, $now, $tags = null ) {
         $id = wp_generate_uuid4();
-        $body = wp_json_encode( array( 'event_id' => $id, 'scope' => 'site' ) );
+        $body = wp_json_encode( $tags === null ? array( 'event_id' => $id, 'scope' => 'site' )
+            : array( 'event_id' => $id, 'scope' => 'tags', 'tags' => array_values( $tags ) ) );
         $ok = $this->db->insert( $this->table, array(
             'event_id' => $id, 'site_id' => $config->site_id, 'controller' => $config->controller,
             'body' => $body, 'reason' => substr( $reason, 0, 80 ),
@@ -227,13 +229,27 @@ final class CyberEdge_Cache {
     private $config;
     private $http;
     private $clock;
-    private $lscache_purge_queued = false;
     private $admin_page_hook = '';
     private $worker_woken = false;
     private $cache_headers_started = false;
     private $finalizer_registered = false;
     private $response_private_veto = false;
     private $response_ttl_ceiling = null;
+    // Pages live 10 h (below WordPress's 12-24 h nonce lifetime, as WP Rocket);
+    // freshness comes from precise purges. LSCache's 404 lifetime is 1 h.
+    const DEFAULT_TTL = 36000;
+    const MAX_TTL = 36000;
+    const NOT_FOUND_TTL = 3600;
+    // Removed from the edge cache key (WP Rocket's list); same list at the edge.
+    const TRACKING_PREFIXES = array( 'utm_', 'mtm_', 'hsa_' );
+    const TRACKING_KEYS = array( 'pk_source', 'pk_medium', 'pk_campaign', 'pk_keyword', 'pk_cid', 'pk_content',
+        'fb_action_ids', 'fb_action_types', 'fb_source', 'fbclid', 'fbadid', 'campaignid', 'adgroupid', 'adid',
+        'gclid', 'gclsrc', 'gbraid', 'wbraid', 'gad', 'gad_source', 'gad_campaignid', 'gadid', '_ga', '_gl',
+        'age-verified', 'ao_noptimize', 'usqp', 'cn-reloaded', 'sscid', 'mc_cid', 'mc_eid', '_bta_tid', '_bta_c',
+        'trk_contact', 'trk_msg', 'trk_module', 'trk_sid', 'gdfms', 'gdftrk', 'gdffi', '_ke', '_kx',
+        'redirect_log_mongo_id', 'redirect_mongo_id', 'sb_referer_host', 'mkwid', 'pcrid', 'ef_id', 's_kwcid',
+        'msclkid', 'dm_i', 'epik', 'pp', 'ssp_iabi', 'ssp_iaba', 'vgo_ee', 'onlywprocket', 'srsltid', '_sc', '_se',
+        '_hsenc', '_hsmi', 'sfmc_id', 'sfmc_activityid', 'dclid', 'twclid', 'ttclid', 'li_fat_id', 'igshid', 'yclid' );
 
     public function __construct( $outbox, $config = null, $http = 'wp_remote_post', $clock = 'time' ) {
         $this->outbox = $outbox;
@@ -261,17 +277,26 @@ final class CyberEdge_Cache {
     public function register() {
         add_action( 'transition_post_status', array( $this, 'post_transition' ), 100, 3 );
         add_action( 'deleted_post', array( $this, 'post_deleted' ), 100, 2 );
+        // Site-wide, as LSCache and WP Rocket purge everything for these.
         foreach ( array(
             'wp_update_nav_menu', 'wp_delete_nav_menu', 'created_term', 'edited_term', 'delete_term',
-            'set_object_terms', 'switch_theme', 'customize_save_after',
+            'switch_theme', 'customize_save_after', 'update_option_sidebars_widgets',
             'upgrader_process_complete', 'automatic_updates_complete',
+        ) as $hook ) {
+            add_action( $hook, array( $this, 'mutation' ), 100, 0 );
+        }
+        add_action( 'set_object_terms', array( $this, 'object_terms' ), 100, 6 );
+        // WooCommerce: purge the product and the listings that show it.
+        foreach ( array(
             'woocommerce_new_product', 'woocommerce_update_product', 'woocommerce_delete_product',
             'woocommerce_new_product_variation', 'woocommerce_update_product_variation', 'woocommerce_delete_product_variation',
             'woocommerce_product_set_stock', 'woocommerce_variation_set_stock',
             'woocommerce_product_set_stock_status', 'woocommerce_variation_set_stock_status',
         ) as $hook ) {
-            add_action( $hook, array( $this, 'mutation' ), 100, 0 );
+            add_action( $hook, array( $this, 'product_changed' ), 100, 1 );
         }
+        add_action( 'wc_after_products_starting_sales', array( $this, 'products_changed' ), 100, 1 );
+        add_action( 'wc_after_products_ending_sales', array( $this, 'products_changed' ), 100, 1 );
         add_action( 'wp_insert_comment', array( $this, 'comment_inserted' ), 100, 2 );
         add_action( 'edit_comment', array( $this, 'comment_edited' ), 100, 1 );
         add_action( 'transition_comment_status', array( $this, 'comment_transition' ), 100, 3 );
@@ -315,53 +340,142 @@ final class CyberEdge_Cache {
         }
     }
 
+    /**
+     * Pages that show a post, as LSCache purges them by default: the post and
+     * its URL, its neighbours, front page, blog home, every static page (they
+     * may list recent posts), feeds, author, post-type and term archives, and
+     * its date archives. Returns null when the post is unknown (purge the site).
+     */
+    public static function post_tags( $post ) {
+        $post = get_post( $post );
+        if ( ! $post || empty( $post->ID ) ) { return null; }
+        $tags = array( 'Po.' . (int) $post->ID, 'F', 'H', 'PGS', 'FD', 'A.' . (int) $post->post_author, 'PT.' . $post->post_type );
+        $link = get_permalink( $post );
+        if ( is_string( $link ) && $link !== '' ) {
+            $url = self::url_tag( wp_make_link_relative( $link ) );
+            if ( $url ) { $tags[] = $url; }
+        }
+        foreach ( get_object_taxonomies( $post->post_type ) as $taxonomy ) {
+            $terms = wp_get_object_terms( $post->ID, $taxonomy, array( 'fields' => 'ids' ) );
+            if ( is_array( $terms ) ) { foreach ( $terms as $term ) { $tags[] = 'T.' . (int) $term; } }
+        }
+        $time = strtotime( (string) $post->post_date );
+        if ( $time ) { $tags[] = 'D.' . gmdate( 'Y', $time ); $tags[] = 'D.' . gmdate( 'Ym', $time ); $tags[] = 'D.' . gmdate( 'Ymd', $time ); }
+        if ( function_exists( 'get_adjacent_post' ) && $post->post_type === 'post' ) {
+            $previous = isset( $GLOBALS['post'] ) ? $GLOBALS['post'] : null;
+            $GLOBALS['post'] = $post;
+            foreach ( array( true, false ) as $older ) {
+                $near = get_adjacent_post( false, '', $older );
+                if ( $near && ! empty( $near->ID ) ) { $tags[] = 'Po.' . (int) $near->ID; }
+            }
+            $GLOBALS['post'] = $previous;
+        }
+        $tags = array_values( array_unique( array_filter( $tags, array( __CLASS__, 'valid_tag' ) ) ) );
+        return count( $tags ) <= 256 ? $tags : null;
+    }
+
+    private function enqueue_post( $reason, $post ) {
+        return $this->enqueue( $reason, self::post_tags( $post ) );
+    }
+
     public function post_transition( $new, $old, $post ) {
         if ( ( $new === 'publish' || $old === 'publish' ) && $post->post_type !== 'revision' ) {
-            $this->enqueue( 'post_status_or_content' );
+            $this->enqueue_post( 'post_status_or_content', $post );
         }
     }
 
     public function post_deleted( $id, $post ) {
-        if ( $post && $post->post_type !== 'revision' ) { $this->enqueue( 'deleted_post' ); }
+        if ( $post && $post->post_type !== 'revision' ) { $this->enqueue_post( 'deleted_post', $post ); }
     }
 
     public function mutation() { $this->enqueue( current_filter() ); }
 
+    /** Term changes on a post: its pages plus the term archives it left. */
+    public function object_terms( $object_id, $terms = array(), $tt_ids = array(), $taxonomy = '', $append = false, $old_tt_ids = array() ) {
+        $post = get_post( $object_id );
+        if ( ! $post || $post->post_type === 'revision' || $post->post_status !== 'publish' ) { return; }
+        $tags = self::post_tags( $post );
+        if ( $tags !== null && is_array( $old_tt_ids ) ) {
+            foreach ( $old_tt_ids as $tt_id ) {
+                $term = get_term_by( 'term_taxonomy_id', (int) $tt_id );
+                if ( $term && isset( $term->term_id ) ) { $tags[] = 'T.' . (int) $term->term_id; }
+            }
+            $tags = array_values( array_unique( $tags ) );
+        }
+        $this->enqueue( 'set_object_terms', $tags );
+    }
+
+    public function product_changed( $product = null ) {
+        $id = is_object( $product ) && method_exists( $product, 'get_id' ) ? $product->get_id() : (int) $product;
+        if ( is_object( $product ) && method_exists( $product, 'get_parent_id' ) && $product->get_parent_id() ) {
+            $id = $product->get_parent_id();
+        } elseif ( $id && ( $parent = wp_get_post_parent_id( $id ) ) ) {
+            $id = $parent;
+        }
+        $this->enqueue( current_filter(), $id ? self::post_tags( $id ) : null );
+    }
+
+    public function products_changed( $ids = array() ) {
+        $tags = array();
+        foreach ( (array) $ids as $id ) {
+            $more = self::post_tags( $id );
+            if ( $more === null ) { $this->enqueue( current_filter() ); return; }
+            $tags = array_merge( $tags, $more );
+        }
+        $tags = array_values( array_unique( $tags ) );
+        $this->enqueue( current_filter(), $tags && count( $tags ) <= 256 ? $tags : null );
+    }
+
+    private function enqueue_comment( $reason, $comment ) {
+        $post_id = is_object( $comment ) && isset( $comment->comment_post_ID ) ? (int) $comment->comment_post_ID : 0;
+        return $this->enqueue( $reason, $post_id ? self::post_tags( $post_id ) : null );
+    }
+
     public function comment_inserted( $id, $comment ) {
         if ( $comment && (string) $comment->comment_approved === '1' ) {
-            $this->enqueue( 'wp_insert_comment' );
+            $this->enqueue_comment( 'wp_insert_comment', $comment );
         }
     }
 
     public function comment_edited( $id ) {
         $comment = get_comment( $id );
         if ( $comment && (string) $comment->comment_approved === '1' ) {
-            $this->enqueue( 'edit_comment' );
+            $this->enqueue_comment( 'edit_comment', $comment );
         }
     }
 
     public function comment_transition( $new, $old, $comment ) {
         if ( $new !== $old && ( $new === 'approved' || $old === 'approved' ) ) {
-            $this->enqueue( 'transition_comment_status' );
+            $this->enqueue_comment( 'transition_comment_status', $comment );
         }
     }
 
     public function comment_deleted( $id, $comment ) {
         if ( $comment && (string) $comment->comment_approved === '1' ) {
-            $this->enqueue( 'deleted_comment' );
+            $this->enqueue_comment( 'deleted_comment', $comment );
         }
     }
 
+    /**
+     * LSCache's final public purge set. Its tags are ours plus a site prefix
+     * ("<3 hex>[blog]_Po.12"), so map them to a precise purge; "*", the site
+     * root tag or anything unrecognised purges the whole site.
+     */
     public function purge_tags( $tags, $private ) {
-        if ( ! $private && ! empty( $tags ) && ! $this->lscache_purge_queued ) {
-            if ( $this->enqueue( 'litespeed_public_purge_tags' ) ) {
-                $this->lscache_purge_queued = true;
-            }
+        if ( $private || empty( $tags ) || ! is_array( $tags ) ) { return $tags; }
+        $mapped = array();
+        foreach ( $tags as $tag ) {
+            $name = is_string( $tag ) ? preg_replace( '/\A[0-9a-f]{3}[0-9]*_/', '', $tag ) : null;
+            if ( ! is_string( $name ) || $name === '' || $name === '*' || ! self::valid_tag( $name ) ) { $mapped = null; break; }
+            $mapped[] = $name;
         }
+        if ( $mapped !== null ) { $mapped = array_values( array_unique( $mapped ) ); }
+        if ( $mapped !== null && count( $mapped ) > 256 ) { $mapped = null; }
+        $this->enqueue( 'litespeed_public_purge_tags', $mapped );
         return $tags;
     }
 
-    public function enqueue( $reason ) {
+    public function enqueue( $reason, $tags = null ) {
         // WordPress and origin-cache hooks run before a first connection too.
         // No edge destination exists yet; this is not a failed durable write.
         // Never clear an existing alarm or ignore an invalid configured source.
@@ -372,8 +486,14 @@ final class CyberEdge_Cache {
                 if ( $status['pending'] === 0 ) { return false; }
                 throw new RuntimeException( 'CyberEdge cannot treat a stranded or unreadable outbox as a new connection.' );
             }
-            // Do not deduplicate in request memory: another worker can finish before a later mutation.
-            $id = $this->outbox->enqueue( $this->configuration(), $reason, call_user_func( $this->clock ) );
+            if ( $tags !== null ) {
+                $tags = array_values( array_unique( array_filter( (array) $tags, array( __CLASS__, 'valid_tag' ) ) ) );
+                sort( $tags );
+                if ( ! $tags || count( $tags ) > 256 ) { $tags = null; }
+            }
+            // Do not deduplicate in request memory: another worker can deliver and
+            // apply an earlier event before a later mutation in this request.
+            $id = $this->outbox->enqueue( $this->configuration(), $reason, call_user_func( $this->clock ), $tags );
             $this->wake_worker();
             return $id;
         } catch ( Throwable $error ) {
@@ -445,7 +565,7 @@ final class CyberEdge_Cache {
         // WooCommerce gathers these exact attribution values in JavaScript and
         // submits them at checkout; they do not select public HTML or a cart.
         // Never permit arbitrary sbjs_ prefixes or Woo session/login cookies.
-        return is_string( $name ) && preg_match( '/\A(?:_ga|_gid|_gat|_gcl_au|_fbp|_ga_[A-Za-z0-9]+|_gat_[A-Za-z0-9]+|sbjs_(?:current|current_add|first|first_add|migrations|session|udata))\z/D', $name ) === 1;
+        return is_string( $name ) && preg_match( '/\A(?:_ga|_gid|_gat|_gcl_au|_fbp|_ga_[A-Za-z0-9]+|_gat_[A-Za-z0-9]+|sbjs_(?:current|current_add|first|first_add|migrations|session|udata)|_fbc|_gcl_(?:aw|dc|gb|gs)|_clck|_clsk|_hjid|_hjFirstSeen|_hjAbsoluteSessionInProgress|_hjSessionUser_[A-Za-z0-9]+|_hjSession_[A-Za-z0-9]+|_hjIncludedInSessionSample_[A-Za-z0-9]+|_uetsid|_uetvid|_ttp|_pin_unauth|_pk_(?:id|ses)\.[A-Za-z0-9.]+|g_state|__cf_bm|_cfuvid|cf_clearance)\z/D', $name ) === 1;
     }
 
     private static function private_request_cookies() {
@@ -461,8 +581,9 @@ final class CyberEdge_Cache {
             $value = substr( $part, $separator + 1 );
             // Validate the original names before PHP replaces dots/spaces with
             // underscores. Reject duplicate, quoted, or malformed cookie pairs.
+            $octets = $name === 'g_state' ? '/\A[\x21-\x3A\x3C-\x5B\x5D-\x7E]*\z/D' : '/\A[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]*\z/D';
             if ( ! self::public_analytics_cookie_name( $name ) || isset( $seen[$name] ) ||
-                preg_match( '/\A[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]*\z/D', $value ) !== 1 ) {
+                preg_match( $octets, $value ) !== 1 ) {
                 return true;
             }
             $seen[$name] = true;
@@ -482,6 +603,23 @@ final class CyberEdge_Cache {
             preg_match( '/(?:\A|,)\s*no-cache\s*(?:=|,|\z)/i', $pragma ) === 1;
     }
 
+    /** True when the query string holds anything besides ad/campaign tracking. */
+    private static function content_query() {
+        $query = $_SERVER['QUERY_STRING'] ?? '';
+        if ( ! is_string( $query ) ) { return true; }
+        if ( $query === '' ) { return ! empty( $_GET ); }
+        foreach ( explode( '&', $query ) as $pair ) {
+            $name = strtolower( rawurldecode( (string) strtok( $pair, '=' ) ) );
+            if ( $pair === '' || $name === '' ) { return true; }
+            $tracking = in_array( $name, self::TRACKING_KEYS, true );
+            foreach ( self::TRACKING_PREFIXES as $prefix ) {
+                if ( strpos( $name, $prefix ) === 0 && strlen( $name ) > strlen( $prefix ) ) { $tracking = true; }
+            }
+            if ( ! $tracking ) { return true; }
+        }
+        return false;
+    }
+
     private static function response_cache_ttl( $value, $native ) {
         $ages = array(); $shared = array();
         foreach ( explode( ',', $value ) as $directive ) {
@@ -499,10 +637,13 @@ final class CyberEdge_Cache {
     public function cache_policy() {
         if ( ! $this->cache_enabled() ) { return 'private,no-cache,no-store'; }
         $status = http_response_code();
-        if ( $status !== false && $status !== 200 ) { return 'private,no-cache,no-store'; }
-        $ttl = defined( 'CYBEREDGE_CACHE_TTL' ) ? (int) CYBEREDGE_CACHE_TTL : 300;
+        $not_found = $status === 404 && is_404();
+        if ( $status !== false && $status !== 200 && ! $not_found ) { return 'private,no-cache,no-store'; }
+        $ttl = defined( 'CYBEREDGE_CACHE_TTL' ) ? (int) CYBEREDGE_CACHE_TTL : self::DEFAULT_TTL;
         if ( $ttl <= 0 ) { return 'no-cache,no-store'; }
-        $ttl = min( 3600, $ttl );
+        $ttl = min( self::MAX_TTL, $ttl );
+        if ( $not_found ) { $ttl = min( $ttl, self::NOT_FOUND_TTL ); }
+        $feed = is_feed();
         foreach ( headers_list() as $header ) {
             if ( preg_match( '/\A(X-LiteSpeed-Cache-Control|Cache-Control):\s*(.*)\z/i', $header, $control ) ) {
                 $origin_ttl = self::response_cache_ttl( $control[2], strcasecmp( $control[1], 'X-LiteSpeed-Cache-Control' ) === 0 );
@@ -511,7 +652,8 @@ final class CyberEdge_Cache {
             }
             if ( stripos( $header, 'Set-Cookie:' ) === 0 ||
                 ( preg_match( '/^(?:X-LiteSpeed-Cache-Control|Cache-Control):/i', $header ) && preg_match( '/\b(?:private|no-cache|no-store)\b|esi\s*=\s*on/i', $header ) ) ||
-                ( stripos( $header, 'Content-Type:' ) === 0 && stripos( $header, 'text/html' ) === false ) ||
+                ( stripos( $header, 'Content-Type:' ) === 0 && stripos( $header, 'text/html' ) === false &&
+                    ! ( $feed && preg_match( '/\AContent-Type:\s*(?:application\/(?:rss|atom|rdf)\+xml|text\/xml|application\/xml)\b/i', $header ) ) ) ||
                 stripos( $header, 'X-LiteSpeed-Vary:' ) === 0 ||
                 ( stripos( $header, 'Vary:' ) === 0 && preg_match( '/\A\s*accept-encoding\s*\z/i', substr( $header, 5 ) ) !== 1 ) ) {
                 return 'private,no-cache,no-store';
@@ -520,8 +662,8 @@ final class CyberEdge_Cache {
         if ( ! in_array( $_SERVER['REQUEST_METHOD'] ?? '', array( 'GET', 'HEAD' ), true ) ||
             self::private_request_cookies() || self::request_cache_veto() || ! empty( $_SERVER['HTTP_RANGE'] ) || ! empty( $_SERVER['HTTP_AUTHORIZATION'] ) ||
             ! empty( $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ) || ! empty( $_SERVER['PHP_AUTH_USER'] ) ||
-            ! empty( $_SERVER['QUERY_STRING'] ) || is_user_logged_in() || is_admin() ||
-            is_preview() || is_search() || is_404() || is_feed() || is_trackback() || post_password_required() ||
+            self::content_query() || is_user_logged_in() || is_admin() ||
+            is_preview() || is_search() || is_trackback() || post_password_required() ||
             ( defined( 'REST_REQUEST' ) && REST_REQUEST ) || wp_doing_ajax() ||
             ( function_exists( 'is_cart' ) && is_cart() ) || ( function_exists( 'is_checkout' ) && is_checkout() ) ||
             ( function_exists( 'is_account_page' ) && is_account_page() ) ||
@@ -529,6 +671,46 @@ final class CyberEdge_Cache {
             return 'private,no-cache,no-store';
         }
         return 'public,max-age=' . $ttl;
+    }
+
+    /** LSCache-compatible tag of a site path ("URL." + md5 of the slashed path). */
+    public static function url_tag( $uri ) {
+        $path = strtok( (string) $uri, '?' );
+        if ( ! is_string( $path ) || $path === '' ) { return null; }
+        return 'URL.' . md5( trailingslashit( $path ) );
+    }
+
+    /** Purge tags of the current public page, named as LSCache names them. */
+    public function page_tags() {
+        $tags = array();
+        $url = self::url_tag( urldecode( (string) ( $_SERVER['REQUEST_URI'] ?? '' ) ) );
+        if ( $url ) { $tags[] = $url; }
+        if ( is_front_page() ) { $tags[] = 'F'; }
+        if ( is_home() ) { $tags[] = 'H'; }
+        if ( is_404() ) { $tags[] = 'HTTP.404'; }
+        if ( is_feed() ) { $tags[] = 'FD'; }
+        if ( is_archive() ) {
+            $object = get_queried_object();
+            if ( is_category() || is_tag() || is_tax() ) {
+                if ( $object && isset( $object->term_id ) ) { $tags[] = 'T.' . (int) $object->term_id; }
+            } elseif ( is_post_type_archive() ) {
+                $type = get_query_var( 'post_type' );
+                foreach ( (array) $type as $name ) { if ( is_string( $name ) ) { $tags[] = 'PT.' . $name; } }
+            } elseif ( is_author() ) {
+                $tags[] = 'A.' . (int) get_queried_object_id();
+            } elseif ( is_date() ) {
+                $year = (int) get_query_var( 'year' ); $month = (int) get_query_var( 'monthnum' ); $day = (int) get_query_var( 'day' );
+                if ( $year ) { $tags[] = 'D.' . sprintf( '%04d', $year ) . ( $month ? sprintf( '%02d', $month ) . ( $day ? sprintf( '%02d', $day ) : '' ) : '' ); }
+            }
+        } elseif ( is_singular() ) {
+            $tags[] = 'Po.' . (int) get_queried_object_id();
+            if ( is_page() ) { $tags[] = 'PGS'; }
+        }
+        return array_values( array_unique( array_filter( $tags, array( __CLASS__, 'valid_tag' ) ) ) );
+    }
+
+    public static function valid_tag( $tag ) {
+        return is_string( $tag ) && preg_match( '/\A[A-Za-z0-9][A-Za-z0-9._:\/@-]{0,199}\z/D', $tag ) === 1;
     }
 
     /** Existing installations remain enabled; invalid persisted state fails closed. */
@@ -553,6 +735,10 @@ final class CyberEdge_Cache {
                 // Origin LiteSpeed consumes its internal header. This shared-cache
                 // directive survives to CyberEdge while keeping browser max-age zero.
                 header( 'Cache-Control: public,max-age=0,s-maxage=' . $match[1], true );
+                // Precise purges: the edge stores these tags with the page (an
+                // origin LiteSpeed would consume X-LiteSpeed-Tag itself).
+                $tags = $this->page_tags();
+                if ( $tags ) { header( 'X-CyberEdge-Tag: ' . implode( ',', $tags ), true ); }
             }
         }
     }
@@ -650,8 +836,8 @@ final class CyberEdge_Cache {
 
     public function admin_assets( $hook ) {
         if ( $hook !== $this->admin_page_hook ) { return; }
-        wp_enqueue_style( 'cyberedge-cache-admin', plugins_url( 'assets/admin.css', __FILE__ ), array(), '0.4.8' );
-        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.4.8', true );
+        wp_enqueue_style( 'cyberedge-cache-admin', plugins_url( 'assets/admin.css', __FILE__ ), array(), '0.5.0' );
+        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.5.0', true );
         wp_localize_script( 'cyberedge-cache-admin', 'CyberEdgeCacheAdmin', array(
             'homeUrl' => home_url( '/' ),
             'cacheHeader' => 'X-CyberEdge-Cache',

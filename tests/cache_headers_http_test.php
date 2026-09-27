@@ -27,6 +27,9 @@ if ( PHP_SAPI === 'cli-server' ) {
     function is_search() { return false; } function is_404() { return false; }
     function is_feed() { return false; } function is_trackback() { return false; }
     function post_password_required() { return false; } function wp_doing_ajax() { return false; }
+    function is_front_page() { return false; } function is_home() { return false; } function is_archive() { return false; }
+    function is_singular() { return true; } function is_page() { return false; } function get_queried_object_id() { return 42; }
+    function trailingslashit( $value ) { return rtrim( $value, '/\\' ) . '/'; }
     $wpdb = (object) array( 'prefix' => 'wp_' );
     require __DIR__ . '/../cyberedge-cache/cyberedge-cache.php';
     $mode = trim( parse_url( $_SERVER['REQUEST_URI'], PHP_URL_PATH ), '/' );
@@ -98,12 +101,21 @@ try {
             $http_response_header = array();
             $body = file_get_contents( 'http://' . $address . '/' . $prefix . $mode, false, stream_context_create( array( 'http' => array( 'timeout' => 3 ) ) ) );
             $controls = array_values( preg_grep( '/^Cache-Control:/i', $http_response_header ) );
-            $expected = in_array( $mode, array( 'public', 'long' ), true ) ? 'Cache-Control: public,max-age=0,s-maxage=300' : 'Cache-Control: private,no-cache,no-store';
+            $expected = $mode === 'public' ? 'Cache-Control: public,max-age=0,s-maxage=36000'
+                : ( $mode === 'long' ? 'Cache-Control: public,max-age=0,s-maxage=900' : 'Cache-Control: private,no-cache,no-store' );
             if ( strpos( $mode, '-short' ) !== false ) { $expected = 'Cache-Control: public,max-age=0,s-maxage=60'; }
             if ( $controls !== array( $expected ) || $body !== '<!doctype html><title>Public fixture</title>' ) {
                 throw new RuntimeException( $prefix . $mode . ' failed: ' . json_encode( $controls ) );
             }
             $checks++;
+            if ( $mode === 'public' && $prefix === '' ) {
+                // LSCache-compatible purge tags reach the edge with a public page.
+                $tags = array_values( preg_grep( '/^X-CyberEdge-Tag:/i', $http_response_header ) );
+                if ( $tags !== array( 'X-CyberEdge-Tag: URL.' . md5( '/public/' ) . ',Po.42' ) ) {
+                    throw new RuntimeException( 'public page tags: ' . json_encode( $tags ) );
+                }
+                $checks++;
+            }
         }
     }
     $attribution = array( 'sbjs_current', 'sbjs_current_add', 'sbjs_first', 'sbjs_first_add', 'sbjs_migrations', 'sbjs_session', 'sbjs_udata' );
@@ -123,7 +135,7 @@ try {
         $http_response_header = array();
         $body = file_get_contents( 'http://' . $address . '/' . $mode, false, stream_context_create( array( 'http' => array( 'timeout' => 3, 'header' => 'Cookie: ' . $cookie ) ) ) );
         $controls = array_values( preg_grep( '/^Cache-Control:/i', $http_response_header ) );
-        $expected = $public ? 'Cache-Control: public,max-age=0,s-maxage=300' : 'Cache-Control: private,no-cache,no-store';
+        $expected = $public ? 'Cache-Control: public,max-age=0,s-maxage=36000' : 'Cache-Control: private,no-cache,no-store';
         if ( $controls !== array( $expected ) || $body !== '<!doctype html><title>Public fixture</title>' ) {
             throw new RuntimeException( 'Attribution request failed its actual HTTP policy contract' );
         }
