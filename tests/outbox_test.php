@@ -237,15 +237,21 @@ try {
     $before = $outbox->status()['pending'];
     check( apply_filters( 'litespeed_purge_tags', array( 'a1b_Po.12', 'a1b2_F' ), false ) === array( 'a1b_Po.12', 'a1b2_F' ), 'LSCWP tag filter is unchanged' );
     check( $body_of_last() ['tags'] === array( 'F', 'Po.12' ), 'LSCWP site-prefixed tags map to the same precise tags' );
+    // Exactly what LSCache 7.9 passed on a real post save (empty hash prefix).
+    apply_filters( 'litespeed_purge_tags', array( '_Po.1', '_URL.8bce20f2201bdf5289459c13c9cf5987', '_W.recent-posts-1',
+        '_T.1', '_FD', '_A.1', '_PT.post', '_post', '_F', '_H', '_PGS', '_PGSRP', '_D.202609', '_REST' ), false );
+    $event = $body_of_last();
+    check( $event['scope'] === 'tags' && in_array( 'Po.1', $event['tags'], true ) && in_array( 'W.recent-posts-1', $event['tags'], true )
+        && ! in_array( '_Po.1', $event['tags'], true ), 'LSCWP empty-hash "_" prefix maps to precise tags' );
     apply_filters( 'litespeed_purge_tags', array( 'a1b_' ), false );
     check( $body_of_last()['scope'] === 'site', 'LSCWP site root tag purges the whole site' );
     apply_filters( 'litespeed_purge_tags', array( '*' ), false );
     check( $body_of_last()['scope'] === 'site', 'LSCWP purge-all purges the whole site' );
     apply_filters( 'litespeed_purge_tags', array( 'private' ), true );
     apply_filters( 'litespeed_purge_tags', array(), false );
-    check( $outbox->status()['pending'] === $before + 3, 'Only public LSCWP purge sets queue events' );
+    check( $outbox->status()['pending'] === $before + 4, 'Only public LSCWP purge sets queue events' );
     call_user_func( WP_CLI::$commands['cyberedge purge'] );
-    check( $outbox->status()['pending'] === $before + 4 && $body_of_last()['scope'] === 'site', 'WP-CLI persists a whole-site purge without network' );
+    check( $outbox->status()['pending'] === $before + 5 && $body_of_last()['scope'] === 'site', 'WP-CLI persists a whole-site purge without network' );
     check( count( $http_calls ) === 0, 'No mutation or toolbar event calls HTTP' );
 
     // Reopen a separate connection to prove events persist outside the plugin/request instance.

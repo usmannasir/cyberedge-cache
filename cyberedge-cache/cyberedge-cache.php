@@ -3,7 +3,7 @@
  * Plugin Name: CyberEdge Cache
  * Plugin URI: https://github.com/usmannasir/cyberedge-cache
  * Description: LSCache-compatible page caching on the CyberEdge network: tagged pages, precise durable purges and conservative public cache signals.
- * Version: 0.5.0
+ * Version: 0.5.1
  * Requires at least: 6.2
  * Requires PHP: 7.4
  * Author: CyberPanel
@@ -458,14 +458,15 @@ final class CyberEdge_Cache {
 
     /**
      * LSCache's final public purge set. Its tags are ours plus a site prefix
-     * ("<3 hex>[blog]_Po.12"), so map them to a precise purge; "*", the site
+     * ("<3 hex>[blog]_Po.12" or "_Po.12"), so map them to a precise purge; "*", the site
      * root tag or anything unrecognised purges the whole site.
      */
     public function purge_tags( $tags, $private ) {
         if ( $private || empty( $tags ) || ! is_array( $tags ) ) { return $tags; }
         $mapped = array();
         foreach ( $tags as $tag ) {
-            $name = is_string( $tag ) ? preg_replace( '/\A[0-9a-f]{3}[0-9]*_/', '', $tag ) : null;
+            // Prefix is "<3 hex>[blog id]_", or just "_" when LSCache's hash is empty.
+            $name = is_string( $tag ) ? preg_replace( '/\A(?:[0-9a-f]{3})?[0-9]*_/', '', $tag ) : null;
             if ( ! is_string( $name ) || $name === '' || $name === '*' || ! self::valid_tag( $name ) ) { $mapped = null; break; }
             $mapped[] = $name;
         }
@@ -836,8 +837,8 @@ final class CyberEdge_Cache {
 
     public function admin_assets( $hook ) {
         if ( $hook !== $this->admin_page_hook ) { return; }
-        wp_enqueue_style( 'cyberedge-cache-admin', plugins_url( 'assets/admin.css', __FILE__ ), array(), '0.5.0' );
-        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.5.0', true );
+        wp_enqueue_style( 'cyberedge-cache-admin', plugins_url( 'assets/admin.css', __FILE__ ), array(), '0.5.1' );
+        wp_enqueue_script( 'cyberedge-cache-admin', plugins_url( 'assets/admin.js', __FILE__ ), array(), '0.5.1', true );
         wp_localize_script( 'cyberedge-cache-admin', 'CyberEdgeCacheAdmin', array(
             'homeUrl' => home_url( '/' ),
             'cacheHeader' => 'X-CyberEdge-Cache',

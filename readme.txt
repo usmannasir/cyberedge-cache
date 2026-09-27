@@ -4,7 +4,7 @@ Tags: cache, edge cache, cdn, litespeed, woocommerce
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 0.5.0
+Stable tag: 0.5.1
 License: GPLv3 or later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -47,6 +47,9 @@ Browser refresh can send a zero-max-age request, and DevTools Disable cache can 
 WordPress mutations synchronously create a durable local outbox event. A background worker sends signed events to the site's CyberEdge controller. Delivery retries reuse the same event identity until the controller provides a valid acknowledgement.
 
 == Changelog ==
+
+= 0.5.1 =
+* LiteSpeed Cache purges on installs whose tag prefix is only "_" now map to precise tags instead of a whole-site purge.
 
 = 0.5.0 =
 * LSCache-compatible page tags (F, H, Po., PGS, T., A., PT., D., FD, HTTP.404, URL.) are sent to CyberEdge as X-CyberEdge-Tag.
